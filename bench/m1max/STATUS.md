@@ -224,9 +224,45 @@ Findings:
 - Projection if prod reaches ~80% of roofline (285 GB/s): matvec (65.5% of
   decode) x0.65 time -> tg 11.5 -> ~15 (+30%); full roofline would be ~+45%.
 
+## Step B0 result — dot decomposition of the 356->191 GB/s drop (2026-09-23,
+`bench/m1max/roofline_m1_b0.jsonl` + `_b0b.jsonl`)
+
+Bench-only arms, production loop structure and dispatch, each adding one
+resource class to the pure stream (all shapes; DRAM-bound 248320x5120 and
+L2-resident 17408x5120 columns shown):
+
+| arm (cumulative) | DRAM GB/s | L2 GB/s | step cost |
+|---|--:|--:|--|
+| bench_stream2 (weights only) | 359 | 615 | — |
+| + x loads (prod indices) | 359 | 559 | 0% / -9% |
+| + scales (read + fp multiply) | 337 | 502 | -6% / -10% |
+| + HALF the nibble dots (`bench_sc_dot2`) | **332** | 321 | -1.5% / -36% |
+| + full dots = production (`bench_sc_dot4` == prod to noise) | **191** | 182 | **-42% / -43%** |
+
+Findings:
+- x redundancy is NOT the problem (+0–8%; invisible at DRAM shapes).
+- scale streams cost ~5–10%.
+- **the nibble-dot shift/mask chain is the wall**: it alone takes 337 -> 191
+  (DRAM) and the dot2 control arm shows a kernel with only HALF the dot
+  arithmetic sits at 332 — essentially back to the roofline. The kernel is
+  ALU/dependency-bound inside the dot, not bandwidth-bound.
+- `bench_sc_dot4` reproduces production to noise (191.2 vs 191.1) — the
+  decomposition is self-consistent.
+
+Implication (see report): a cheaper EXACT nibble dot (fp16 magic-number
+unpack: half(0x6400|n)-1032 == n-8 exactly; products exact in half, sum
+exact in fp32 up to 32512) could target the dot2 arm's 332 GB/s while
+keeping bit-identical math. B1 (x broadcast) alone: ~+5%, below the user's
++25% solo threshold; fold into B2 only if B2 needs the load slots.
+
 ## Pending / next (in order)
 
-1. **matvec Step B — AWAITING USER GO after Step A** (Step A done above).
+0. **matvec Step B2 — AWAITING USER GO after B0** (see B0 section above):
+   rewrite q27_dot8_q4 as an exact fp16 magic-number dot as a bench arm
+   FIRST (`bench_sc_halfdot4`), measure at the same geometry; only then
+   engine-integrate behind `Q27_METAL_Q4_ARM`. Gate stays digest-equality
+   (the rewrite is mathematically bit-identical by construction).
+1. **(superseded) matvec Step B — AWAITING USER GO after Step A** (Step A done above).
    Planned split per user's 2026-09-23 note: B0 = bench-only incremental
    arms (stream+x, stream+scales, …) to decompose where 356->185 GB/s is
    lost; B1 = x broadcast via threadgroup memory (bit-identical expected,

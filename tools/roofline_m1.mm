@@ -59,8 +59,13 @@ int main(int argc, char** argv) try {
     if (!streamlib) { fprintf(stderr, "stream: %s\n", err.localizedDescription.UTF8String); return 1; }
         struct PSO { id<MTLComputePipelineState> p; NSString* name; };
     std::vector<PSO> psos;
-    id<MTLFunction> sf = [streamlib newFunctionWithName:@"bench_stream"];
-    psos.push_back({[device newComputePipelineStateWithFunction:sf error:&err], @"bench_stream"});
+    for (NSString* sn : @[ @"bench_stream", @"bench_stream2", @"bench_stream_x", @"bench_stream_sc", @"bench_sc_dot2", @"bench_sc_dot4" ]) {
+        id<MTLFunction> sf = [streamlib newFunctionWithName:sn];
+        if (!sf) { fprintf(stderr, "missing stream fn %s\n", sn.UTF8String); continue; }
+        auto pso = [device newComputePipelineStateWithFunction:sf error:&err];
+        psos.push_back({pso, sn});
+        fprintf(stderr, "%s maxTotal=%lu\n", sn.UTF8String, (unsigned long)pso.maxTotalThreadsPerThreadgroup);
+    }
     for (int i = 0; i < 2; i++) {
         NSString* fn = i ? @"q27_matvec_q4_quantized_r2" : @"q27_matvec_q4_quantized";
         id<MTLFunction> f = [lib newFunctionWithName:fn];
@@ -106,8 +111,7 @@ int main(int argc, char** argv) try {
         @autoreleasepool {
             auto enc = [q commandBuffer];
             for (auto& ps : psos) {
-                const NSUInteger rpg = [ps.name isEqualToString:@"bench_stream"] ||
-                        [ps.name isEqualToString:@"q27_matvec_q4_quantized"] ? 32 : 16;
+                const NSUInteger rpg = [ps.name isEqualToString:@"q27_matvec_q4_quantized_r2"] ? 16 : 32;
                 auto ce = [enc computeCommandEncoder];
                 [ce setComputePipelineState:ps.p];
                 [ce setBuffer:W offset:0 atIndex:0];
@@ -125,8 +129,7 @@ int main(int argc, char** argv) try {
         }
         // Timed run per arm.
         for (auto& ps : psos) {
-            const NSUInteger rpg = [ps.name isEqualToString:@"bench_stream"] ||
-                    [ps.name isEqualToString:@"q27_matvec_q4_quantized"] ? 32 : 16;
+            const NSUInteger rpg = [ps.name isEqualToString:@"q27_matvec_q4_quantized_r2"] ? 16 : 32;
             int iters = std::max(3, (int)(300000000 / (double)wbytes * 30));  // >=30 passes
             iters = std::min(iters, 60);
             double best = 1e30;
