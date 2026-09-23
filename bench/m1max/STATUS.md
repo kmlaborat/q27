@@ -122,7 +122,7 @@ roughly **3% of peak bandwidth**. The long-context tg decline is mostly this
 slope. Biggest target after matvec.
 
 ### powermetrics (user-run `sudo powermetrics --samplers gpu_power,cpu_power -i 1000`,
-log at repo root `powermetrics_log.txt`, window 19:18–19:30 overlapping run2)
+log at `bench/m1max/powermetrics_log.txt`, window 19:18–19:30 overlapping run2)
 GPU power avg 27.6 W / peak 32.9 W, residency 100% throughout, frequency pinned
 1296 MHz. GPU never idle → not CPU-dispatch-bound, not power-capped; stalls are
 on-device memory stalls. Note: `--samplers memory` does not exist on ASi
@@ -196,6 +196,7 @@ on-device memory stalls. Note: `--samplers memory` does not exist on ASi
 ```
 bench/m1max/
   STATUS.md                      this file
+  INSTRUCTIONS.md                user's tuning instructions (source of truth) + amends
   baseline_chunk_fp16.jsonl      run 1 (old default route)
   baseline_chunk_fp16_run2.jsonl run 2 (powermetrics-overlapped)
   grid_m1.jsonl                  20-trial route x seq grid
@@ -213,6 +214,6 @@ tools/
 src/metal/
   metal_backend.mm               delta fallback wiring, diag logging, family GQA defaults
   q27_kernels.metal              q27_delta_step256, q27_delta_chunk256
-powermetrics_log.txt             (repo root, user-collected)
+  powermetrics_log.txt           (user-collected, 46K samples)
 models/                          q4s weights + tokenizer (downloaded, checksummed)
 ```
