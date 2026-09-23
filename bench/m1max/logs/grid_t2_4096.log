@@ -1,0 +1,3 @@
+q27 Metal: model upload path: whole-mapping (mapping 14.40 GiB, max buffer 18.72 GiB)
+device=Apple M1 Max recommendedMaxWorkingSetSize=26.00 GiB load=8.14 s
+seq=4096  gen=32   pp=    40.8 t/s  tg=  8.39 t/s  mem internal=0.16 GiB

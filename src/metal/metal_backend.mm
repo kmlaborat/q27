@@ -168,6 +168,20 @@ id<MTLComputePipelineState> make_pipeline(id<MTLDevice> device, id<MTLLibrary> l
                                  std::string(error.localizedDescription.UTF8String));
     if (pipeline.threadExecutionWidth != 32 || pipeline.maxTotalThreadsPerThreadgroup < 256)
         throw std::runtime_error("q27 Metal: matvec requires simd width 32 and 256-thread groups");
+    // Q27_METAL_DIAG: occupancy audit for the M1 Max tuning pass. Apple
+    // quantizes maxTotalThreadsPerThreadgroup to the per-thread register cost;
+    // q27_delta_step holds a float saved[32] frame (~>64 regs/thread), which
+    // caps below 512 threads on Apple7 (M1) cores while Apple8+ clears it.
+    // Logging the real numbers separates that register-pressure hypothesis
+    // (b) from threadgroup-memory limits (a: the delta kernels allocate only
+    // 3.5KB of threadgroup memory, far under M1's 32KB, so (a) is ruled out
+    // from the source) and any hard Apple7 ceiling (c: M1 reports
+    // maxThreadsPerThreadgroup 1024-2048 generally, so 512 is physically
+    // launchable -- the cap is the pipeline's register cost, not the GPU).
+    if (getenv("Q27_METAL_DIAG"))
+        fprintf(stderr, "q27 metal diag: %s execWidth=%lu maxTotal=%lu\n",
+                name.UTF8String, (unsigned long)pipeline.threadExecutionWidth,
+                (unsigned long)pipeline.maxTotalThreadsPerThreadgroup);
     return pipeline;
 }
 
@@ -292,6 +306,11 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> gates_rows;
     id<MTLComputePipelineState> conv_chunked;
     id<MTLComputePipelineState> delta_chunked;
+    // 256-thread fallbacks, selected at dispatch time when the 512-thread
+    // originals report sub-512 occupancy on this GPU (M1 Max: 448). See
+    // q27_kernels.metal for the contract.
+    id<MTLComputePipelineState> delta256;
+    id<MTLComputePipelineState> delta_chunked256;
     id<MTLComputePipelineState> l2_rows;
     id<MTLComputePipelineState> rope_rows;
     id<MTLComputePipelineState> kv_store_rows;
@@ -740,6 +759,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->gates = make_pipeline(impl_->device, impl_->library, @"q27_gdn_gates");
         impl_->conv = make_pipeline(impl_->device, impl_->library, @"q27_conv_step");
         impl_->delta = make_pipeline(impl_->device, impl_->library, @"q27_delta_step");
+        impl_->delta256 = make_pipeline(impl_->device, impl_->library, @"q27_delta_step256");
         impl_->gated_norm = make_pipeline(impl_->device, impl_->library, @"q27_gated_norm_gdn");
         impl_->embedding_rows = make_pipeline(impl_->device, impl_->library, @"q27_embedding_q8_rows");
         impl_->rms_rows_quantized = make_pipeline(impl_->device, impl_->library, @"q27_rmsnorm_rows_quantized");
@@ -747,6 +767,7 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->gates_rows = make_pipeline(impl_->device, impl_->library, @"q27_gdn_gates_rows");
         impl_->conv_chunked = make_pipeline(impl_->device, impl_->library, @"q27_conv_chunk");
         impl_->delta_chunked = make_pipeline(impl_->device, impl_->library, @"q27_delta_chunk");
+        impl_->delta_chunked256 = make_pipeline(impl_->device, impl_->library, @"q27_delta_chunk256");
         impl_->l2_rows = make_pipeline(impl_->device, impl_->library, @"q27_l2norm_rows");
         impl_->rope_rows = make_pipeline(impl_->device, impl_->library, @"q27_rope_neox_rows");
         impl_->kv_store_rows = make_pipeline(impl_->device, impl_->library, @"q27_kv_store_f16_rows");
@@ -791,6 +812,19 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         if (impl_->topk_logits_p.maxTotalThreadsPerThreadgroup < 1024) {
             impl_->topk_logits_p = nil;
             fprintf(stderr,"q27 Metal: 1024-thread GPU top-k unavailable; using CPU sampling fallback\n");
+        }
+        // M1/M2-generation GPUs (Apple7 family, e.g. M1 Max): the full grid
+        // of decode routes x context length measured blocked-GQA winning
+        // from ~1280 tokens up with block 256 (t2 stays ahead below that;
+        // the shipped 2048/1024 default loses up to 34% in between, see
+        // bench/m1max/grid_m1.jsonl). PPL at 256 is at parity (14.4014 vs
+        // 14.4023, w96/16K). Applied before the env overrides so explicit
+        // Q27_METAL_GQA_* still win.
+        if ([impl_->device supportsFamily:MTLGPUFamilyApple7] &&
+            ![impl_->device supportsFamily:MTLGPUFamilyApple8]) {
+            impl_->gqa_threshold = 1280;
+            if (!getenv("Q27_METAL_GQA_BLOCK") || !*getenv("Q27_METAL_GQA_BLOCK"))
+                impl_->gqa_block = 256;
         }
         if (const char* env = getenv("Q27_METAL_GQA_THRESHOLD"); env && *env)
             impl_->gqa_threshold = (uint32_t)strtoul(env, nullptr, 10);
@@ -2434,7 +2468,12 @@ void MetalBackend::delta_step(const BackendBuffer& state_src, BackendBuffer& sta
                                const BackendBuffer& beta, BackendBuffer& out,
                                uint32_t value_heads, uint32_t qk_heads,
                                uint32_t head_dim) {
-    if(head_dim!=128 || qk_heads!=16 || impl_->delta.maxTotalThreadsPerThreadgroup<512) throw std::runtime_error("q27 Metal: unsupported DeltaNet shape");
+    if(head_dim!=128 || qk_heads!=16) throw std::runtime_error("q27 Metal: unsupported DeltaNet shape");
+    // Occupancy-adaptive dispatch: 512-thread original where it fits, the
+    // 256-thread virtual-tile-loop fallback elsewhere (M1 Max measures 448).
+    const bool delta512 = impl_->delta.maxTotalThreadsPerThreadgroup >= 512;
+    if(!delta512 && impl_->delta256.maxTotalThreadsPerThreadgroup < 256)
+        throw std::runtime_error("q27 Metal: DeltaNet threadgroups below 256 threads");
     const MetalBuffer& src=metal_buffer(state_src); MetalBuffer& dst=metal_buffer(state_dst); const MetalBuffer& cv=metal_buffer(conv);
     const MetalBuffer& gb=metal_buffer(g); const MetalBuffer& bb=metal_buffer(beta); MetalBuffer& o=metal_buffer(out);
     const uint64_t state_bytes=(uint64_t)value_heads*head_dim*head_dim*4;
@@ -2442,10 +2481,10 @@ void MetalBackend::delta_step(const BackendBuffer& state_src, BackendBuffer& sta
     check_range(cv.size(),0,(uint64_t)(qk_heads*2+value_heads)*head_dim*4,"delta conv"); check_range(gb.size(),0,(uint64_t)value_heads*4,"delta g"); check_range(bb.size(),0,(uint64_t)value_heads*4,"delta beta"); check_range(o.size(),0,(uint64_t)value_heads*head_dim*4,"delta output");
     DeltaArgs args{value_heads,qk_heads,head_dim};
     @autoreleasepool {
-        bool own; auto enc=impl_->encoder_for_operation(own, "q27_delta_step"); [enc setComputePipelineState:impl_->delta];
+        bool own; auto enc=impl_->encoder_for_operation(own, "q27_delta_step"); [enc setComputePipelineState:delta512?impl_->delta:impl_->delta256];
         [enc setBuffer:src.handle() offset:0 atIndex:0]; [enc setBuffer:dst.handle() offset:0 atIndex:1]; [enc setBuffer:cv.handle() offset:0 atIndex:2];
         [enc setBuffer:gb.handle() offset:0 atIndex:3]; [enc setBuffer:bb.handle() offset:0 atIndex:4]; [enc setBuffer:o.handle() offset:0 atIndex:5]; [enc setBytes:&args length:sizeof(args) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(value_heads,1,1) threadsPerThreadgroup:MTLSizeMake(512,1,1)]; if(own) impl_->finish_command("DeltaNet recurrence");
+        [enc dispatchThreadgroups:MTLSizeMake(value_heads,1,1) threadsPerThreadgroup:MTLSizeMake(delta512?512:256,1,1)]; if(own) impl_->finish_command("DeltaNet recurrence");
     }
 }
 
@@ -2622,9 +2661,12 @@ void MetalBackend::delta_chunk(const BackendBuffer& state_src, BackendBuffer& st
                                const BackendBuffer& g, const BackendBuffer& beta,
                                BackendBuffer& out, uint32_t value_heads, uint32_t qk_heads,
                                uint32_t head_dim, uint32_t tokens) {
-    if (head_dim != 128 || qk_heads != 16 || !tokens || tokens > 96 ||
-        impl_->delta_chunked.maxTotalThreadsPerThreadgroup < 512)
+    if (head_dim != 128 || qk_heads != 16 || !tokens || tokens > 96)
         throw std::runtime_error("q27 Metal: unsupported chunked DeltaNet shape");
+    // Same occupancy-adaptive dispatch as delta_step (256-thread fallback).
+    const bool chunk512 = impl_->delta_chunked.maxTotalThreadsPerThreadgroup >= 512;
+    if (!chunk512 && impl_->delta_chunked256.maxTotalThreadsPerThreadgroup < 256)
+        throw std::runtime_error("q27 Metal: chunked DeltaNet threadgroups below 256 threads");
     const MetalBuffer& ss = metal_buffer(state_src); MetalBuffer& sd = metal_buffer(state_dst);
     const MetalBuffer& cv = metal_buffer(conv);
     const MetalBuffer& gb = metal_buffer(g); const MetalBuffer& bb = metal_buffer(beta);
@@ -2639,12 +2681,12 @@ void MetalBackend::delta_chunk(const BackendBuffer& state_src, BackendBuffer& st
     DeltaChunkArgs args{value_heads, qk_heads, head_dim, tokens};
     @autoreleasepool {
         bool own; auto enc = impl_->encoder_for_operation(own, "q27_delta_chunk");
-        [enc setComputePipelineState:impl_->delta_chunked];
+        [enc setComputePipelineState:chunk512 ? impl_->delta_chunked : impl_->delta_chunked256];
         [enc setBuffer:ss.handle() offset:0 atIndex:0]; [enc setBuffer:sd.handle() offset:0 atIndex:1];
         [enc setBuffer:cv.handle() offset:0 atIndex:2];
         [enc setBuffer:gb.handle() offset:0 atIndex:3]; [enc setBuffer:bb.handle() offset:0 atIndex:4];
         [enc setBuffer:o.handle() offset:0 atIndex:5]; [enc setBytes:&args length:sizeof(args) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(value_heads,1,1) threadsPerThreadgroup:MTLSizeMake(512,1,1)];
+        [enc dispatchThreadgroups:MTLSizeMake(value_heads,1,1) threadsPerThreadgroup:MTLSizeMake(chunk512 ? 512 : 256, 1, 1)];
         if (own) impl_->finish_command("chunked DeltaNet recurrence");
     }
 }

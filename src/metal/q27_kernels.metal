@@ -1077,6 +1077,68 @@ kernel void q27_delta_step(device const float *state_src [[buffer(0)]],
     if (tile == 0) out[(ulong)head * 128 + j] = part[0][j] + part[1][j] + part[2][j] + part[3][j];
 }
 
+// 256-thread fallback for q27_delta_step, for GPUs whose compiled occupancy
+// for the 512-thread original lands below 512 (measured 448 on M1 Max /
+// Apple7: the float saved[32] frame costs ~64+ registers/thread and Apple's
+// allocator quantizes the threadgroup ceiling accordingly; threadgroup
+// memory — 3.5KB — is nowhere near M1's limit, so register pressure is the
+// sole cause). Two physical tiles loop over the original kernel's four
+// virtual 32-row tiles. The per-virtual-tile arithmetic is written in the
+// same shape and order as the original (row-sequential dot, part[0..3]
+// summed in order), so the result matches what the 512-thread kernel
+// computes where it runs. The state decay value src[i]*decay is recomputed
+// in the update pass instead of kept in registers; it is a bit-exact
+// reproduction of the same product, so dest stores and the q-dot see the
+// identical value sequence.
+kernel void q27_delta_step256(device const float *state_src [[buffer(0)]],
+                               device float *state_dst       [[buffer(1)]],
+                               device const float *conv      [[buffer(2)]],
+                               device const float *g         [[buffer(3)]],
+                               device const float *beta      [[buffer(4)]],
+                               device float *out             [[buffer(5)]],
+                               constant DeltaArgs &args      [[buffer(6)]],
+                               uint head [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]]) {
+    if (head >= args.value_heads || args.head_dim != 128 || args.qk_heads != 16) return;
+    const uint j = tid & 127;
+    const uint tile = tid >> 7;   // 0 or 1; owns virtual tiles 2*tile, 2*tile+1
+    const uint qk = head % args.qk_heads;
+    threadgroup float q[128], k[128], part[4][128], delta[128];
+    if (tile == 0) { q[j] = conv[(ulong)qk * 128 + j] * rsqrt(128.0f); k[j] = conv[2048 + (ulong)qk * 128 + j]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float decay = exp(g[head]);
+    device const float *source = state_src + (ulong)head * 128 * 128;
+    device float *dest = state_dst + (ulong)head * 128 * 128;
+    for (uint vt = tile; vt < 4; vt += 2) {
+        const uint i0 = vt * 32;
+        float prediction = 0.0f;
+        for (uint n = 0; n < 32; n++) {
+            const uint i = i0 + n;
+            prediction += k[i] * (source[(ulong)i * 128 + j] * decay);
+        }
+        part[vt][j] = prediction;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tile == 0) {
+        const float predicted = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+        delta[j] = beta[head] * (conv[4096 + (ulong)head * 128 + j] - predicted);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint vt = tile; vt < 4; vt += 2) {
+        const uint i0 = vt * 32;
+        float result = 0.0f;
+        for (uint n = 0; n < 32; n++) {
+            const uint i = i0 + n;
+            const float value = source[(ulong)i * 128 + j] * decay + k[i] * delta[j];
+            dest[(ulong)i * 128 + j] = value;
+            result += q[i] * value;
+        }
+        part[vt][j] = result;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tile == 0) out[(ulong)head * 128 + j] = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+}
+
 kernel void q27_gated_norm_gdn(device const float *x [[buffer(0)]],
                                 device const float *weight [[buffer(1)]],
                                 device const float *gate [[buffer(2)]],
@@ -3981,6 +4043,77 @@ kernel void q27_delta_chunk(device const float *state_src [[buffer(0)]],
             part[0][j] + part[1][j] + part[2][j] + part[3][j];
     }
     for (uint n = 0; n < 32; n++) sd[(ulong)(i0 + n) * 128 + j] = saved[n];
+}
+
+// 256-thread fallback for q27_delta_chunk; same contract as
+// q27_delta_step256 above (measured occupancy 448 on M1 Max for the
+// original). Each thread owns two of the original's 32-row virtual tiles
+// (64 state rows) as saved[2][32]; Apple7 will spill part of that frame to
+// thread-local memory, which costs bandwidth but not correctness. The
+// per-virtual-tile op order and the part[0..3] reduction order match the
+// 512-thread kernel exactly.
+kernel void q27_delta_chunk256(device const float *state_src [[buffer(0)]],
+                                device float *state_dst       [[buffer(1)]],
+                                device const float *conv      [[buffer(2)]],
+                                device const float *g         [[buffer(3)]],
+                                device const float *beta      [[buffer(4)]],
+                                device float *out             [[buffer(5)]],
+                                constant DeltaChunkArgs &args [[buffer(6)]],
+                                uint head [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]]) {
+    if (head >= args.value_heads || args.head_dim != 128 || args.qk_heads != 16) return;
+    const uint j = tid & 127;
+    const uint tile = tid >> 7;   // 0 or 1; owns virtual tiles 2*tile, 2*tile+1
+    const uint i0a = (2 * tile) * 32, i0b = (2 * tile + 1) * 32;
+    const uint qk = head % args.qk_heads;
+    const ulong conv_row = (ulong)(2 * args.qk_heads + args.value_heads) * 128;
+    const ulong out_row = (ulong)args.value_heads * 128;
+    threadgroup float q[128], k[128], part[4][128], delta[128];
+    device const float *sh = state_src + (ulong)head * 128 * 128;
+    device float *sd = state_dst + (ulong)head * 128 * 128;
+    float savedA[32], savedB[32];
+    for (uint n = 0; n < 32; n++) {
+        savedA[n] = sh[(ulong)(i0a + n) * 128 + j];
+        savedB[n] = sh[(ulong)(i0b + n) * 128 + j];
+    }
+    for (uint t = 0; t < args.tokens; t++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        device const float *cv = conv + (ulong)t * conv_row;
+        if (tile == 0) { q[j] = cv[(ulong)qk * 128 + j] * rsqrt(128.0f); k[j] = cv[2048 + (ulong)qk * 128 + j]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float decay = exp(g[(ulong)t * args.value_heads + head]);
+        float predictionA = 0.0f, predictionB = 0.0f;
+        for (uint n = 0; n < 32; n++) {
+            savedA[n] *= decay;
+            predictionA += k[i0a + n] * savedA[n];
+            savedB[n] *= decay;
+            predictionB += k[i0b + n] * savedB[n];
+        }
+        part[2 * tile][j] = predictionA;
+        part[2 * tile + 1][j] = predictionB;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tile == 0) {
+            const float predicted = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+            delta[j] = beta[(ulong)t * args.value_heads + head] * (cv[4096 + (ulong)head * 128 + j] - predicted);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float resultA = 0.0f, resultB = 0.0f;
+        for (uint n = 0; n < 32; n++) {
+            savedA[n] += k[i0a + n] * delta[j];
+            resultA += q[i0a + n] * savedA[n];
+            savedB[n] += k[i0b + n] * delta[j];
+            resultB += q[i0b + n] * savedB[n];
+        }
+        part[2 * tile][j] = resultA;
+        part[2 * tile + 1][j] = resultB;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tile == 0) out[(ulong)t * out_row + (ulong)head * 128 + j] =
+            part[0][j] + part[1][j] + part[2][j] + part[3][j];
+    }
+    for (uint n = 0; n < 32; n++) {
+        sd[(ulong)(i0a + n) * 128 + j] = savedA[n];
+        sd[(ulong)(i0b + n) * 128 + j] = savedB[n];
+    }
 }
 
 struct L2RowsArgs { uint heads; uint head_dim; uint row_stride; uint tokens; float eps; };

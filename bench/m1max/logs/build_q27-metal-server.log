@@ -1,0 +1,2 @@
+c++ -O2 -std=c++17 -Wall -Wextra -Werror -fobjc-arc -pthread -I src/metal -I src/metal src/metal/metal_server.cpp src/metal/metal_engine.cpp \
+	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp -framework Foundation -framework Metal -o build/q27-metal-server

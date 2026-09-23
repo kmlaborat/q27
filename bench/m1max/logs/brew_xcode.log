@@ -1,0 +1,24 @@
+==> Auto-updating Homebrew...
+Adjust how often this is run with `$HOMEBREW_AUTO_UPDATE_SECS` or disable with
+`$HOMEBREW_NO_AUTO_UPDATE=1`. Hide these hints with `$HOMEBREW_NO_ENV_HINTS=1` (see `man brew`).
+==> Auto-updated Homebrew!
+Updated 1 tap (homebrew/cask).
+
+You have 7 outdated formulae installed.
+
+Warning: Cask 'xcode' is unavailable: No Cask with this name exists.
+==> Searching for similarly named casks...
+==> Casks
+codex
+copilot-for-xcode
+github-copilot-for-xcode
+phoenix-code
+swiftformat-for-xcode
+xcodeclangformat
+xcodepilot
+xcodes-app
+xscope
+zcode
+
+To install codex, run:
+  brew install --cask codex

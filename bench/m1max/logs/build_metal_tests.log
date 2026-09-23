@@ -1,0 +1,6 @@
+c++ -O2 -std=c++17 -Wall -Wextra -Werror -fobjc-arc -pthread -I src/metal src/metal/test_metal_ops.cpp src/metal/metal_backend.mm \
+	       src/loader.cpp -framework Foundation -framework Metal -o build/test-metal-ops
+c++ -O2 -std=c++17 -Wall -Wextra -I src/metal src/metal/test_metal_stream.cpp -o build/test_metal_stream
+c++ -O2 -std=c++17 -Wall -Wextra -Werror -fobjc-arc -pthread -I src/metal src/metal/test_metal_engine_contracts.cpp \
+	       src/metal/metal_engine.cpp src/metal/metal_backend.mm src/loader.cpp \
+	       -framework Foundation -framework Metal -o build/test_metal_engine_contracts
