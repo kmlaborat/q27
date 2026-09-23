@@ -19,6 +19,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <array>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -85,6 +86,7 @@ int main(int argc, char** argv) try {
     std::string text_path, prompt_path;
     uint32_t gen = 96, topk = 16, ctx = 4096, ppl_tokens = 16384, window = 192;
     int reps = 2;
+    bool step_margins = false;
 
     for (int i = 4; i < argc; i++) {
         std::string a = argv[i];
@@ -98,6 +100,7 @@ int main(int argc, char** argv) try {
         else if (a == "--reps") reps = std::stoi(need("--reps"));
         else if (a == "--tokens") ppl_tokens = (uint32_t)std::stoul(need("--tokens"));
         else if (a == "--window") window = (uint32_t)std::stoul(need("--window"));
+        else if (a == "--step-margins") step_margins = true;
         else throw std::runtime_error("unknown arg " + a);
     }
 
@@ -126,12 +129,28 @@ int main(int argc, char** argv) try {
                 std::vector<uint32_t> ids;
                 // top-k fingerprint of the first decode position.
                 auto logits = engine.read_logits();
+                std::vector<std::array<float, 3>> margins;  // {t1, t2, t1id}
+                if (step_margins) {
+                    float m1 = logits[0], m2 = logits[1]; size_t i1 = 0;
+                    for (size_t v = 1; v < logits.size(); v++)
+                        { if (logits[v] > m1) { m2 = m1; m1 = logits[v]; i1 = v; } else if (logits[v] > m2) m2 = logits[v]; }
+                    margins.push_back({m1, m2, (float)i1});
+                }
                 std::vector<uint32_t> order(logits.size());
                 std::iota(order.begin(), order.end(), 0);
                 std::partial_sort(order.begin(), order.begin() + topk, order.end(),
                                   [&](uint32_t a, uint32_t b) { return logits[a] > logits[b]; });
                 ids.push_back(tok);
-                for (uint32_t g = 1; g < gen; g++) ids.push_back(engine.step(ids.back()));
+                for (uint32_t g = 1; g < gen; g++) {
+                    ids.push_back(engine.step(ids.back()));
+                    if (step_margins) {
+                        logits = engine.read_logits();
+                        float m1 = logits[0], m2 = logits[1]; size_t i1 = 0;
+                        for (size_t v = 1; v < logits.size(); v++)
+                            { if (logits[v] > m1) { m2 = m1; m1 = logits[v]; i1 = v; } else if (logits[v] > m2) m2 = logits[v]; }
+                        margins.push_back({m1, m2, (float)i1});
+                    }
+                }
                 std::string h = fnv_md5_like(ids);
                 digest_stream.insert(digest_stream.end(), ids.begin(), ids.end());
                 out << "{\"rep\":" << rep << ",\"prompt\":" << p
@@ -140,7 +159,16 @@ int main(int argc, char** argv) try {
                 out << "],\"top\":[";
                 for (uint32_t k = 0; k < topk; k++)
                     out << (k ? "," : "") << "{\"id\":" << order[k] << ",\"v\":" << logits[order[k]] << "}";
-                out << "]}\n";
+                out << "]";
+                if (step_margins) {
+                    out << ",\"margins\":[";
+                    // ids[g+1] is argmax at margin step g; margin = t1 - t2.
+                    for (size_t g = 0; g < margins.size(); g++)
+                        out << (g ? "," : "") << "[" << ids[g + 1] << "," << margins[g][0] << ","
+                            << margins[g][1] << "," << (uint32_t)margins[g][2] << "]";
+                    out << "]";
+                }
+                out << "}\n";
                 fprintf(stderr, "rep%d p%-3zu %s\n", rep, p, h.c_str());
             }
         }

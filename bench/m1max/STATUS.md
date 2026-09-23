@@ -155,6 +155,30 @@ on-device memory stalls. Note: `--samplers memory` does not exist on ASi
   `tools/metal_canonical_gate.sh` has no canonical for metal-m1 (only metal-m4);
   deriving one is a documented next candidate (CANON_ARCH override exists).
 
+## Golden gate rule (agreed 2026-09-23, calibrated on real data)
+
+Question from user: is the b256-vs-t2 divergence (9/32) harmless rounding or
+systematic argmax change? Study: `--step-margins` added to golden_metal
+(per-step top1/top2 dump); `margins_default.jsonl` vs `margins_b256.jsonl`.
+
+Findings on identical contexts (23 non-branching prompts, 2208 steps):
+- |t1 logit drift| between routes: median 0.035, p99 0.44, **max 2.15** — so
+  the noise is NOT LSB-level; it is fp accumulation-order noise amplified
+  through layers into ~5-8% of confident logit magnitudes. But at confident
+  steps (margin 7-10) it never flips anything.
+- All 9 sequence branches were rooted at steps whose min(top1-top2 margin)
+  over both routes was **0.003–0.079** — deep tie band. No branch was ever
+  rooted at a confident margin. Verdict: tie-band flips + cascade; quality
+  parity confirmed by PPL (Δ0.0009).
+
+Gate for reordering-class changes (anything matvec does): `tools/golden_check.py
+BASELINE.jsonl CANDIDATE.jsonl [--ppl-a --ppl-b]` — PASS iff every prompt's
+FIRST divergence (root) has min-margin <= tie_band (default 0.5, ~2x the
+observed noise p99; observed roots <= 0.08), and |Δppl| <= 0.02. Post-root
+steps are cascade and not evidence. Same-build determinism stays strict by
+digest. A root at margin > band = treat as bug, stop.
+Sanity: the checker passes default-vs-b256 at 0.5 and fails at 0.001.
+
 ## Lessons / false alarms on record
 
 1. **"blk=512 hang" was my tooling artifact**: several trials batched inside one
