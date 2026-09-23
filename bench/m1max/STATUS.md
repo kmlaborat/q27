@@ -197,13 +197,44 @@ Sanity: the checker passes default-vs-b256 at 0.5 and fails at 0.001.
 6. `anchoredit_apply` tool failed with bare exit 1 on this machine; built-in
    edit works.
 
+## Step A result — matvec roofline on M1 Max (2026-09-23, `bench/m1max/roofline_m1.jsonl`)
+
+Harness `tools/roofline_m1.mm` (+ `tools/bench_stream.metal`): loads the
+engine's own kernel source with the same compile flags, dispatches the
+production kernel, the retained r2 arm, and a bench-only pure-uint4-read
+kernel at the identical dispatch geometry, over the q4s file's real tensor
+shapes (read live from the .q27 header), best-of-3 timed reps.
+
+| regime | stream roofline | production q4 | r2 arm |
+|---|--:|--:|--:|
+| DRAM-bound (636 MB, 248320x5120) | **355.8 GB/s (89% of 400 peak)** | 191.3 | 154.2 |
+| L2-resident (26–45 MB shapes) | ~560–590 GB/s | 172–183 | 141–150 |
+
+Findings:
+- The machine can stream 356 GB/s with pure reads in production's dispatch
+  geometry — the DRAM roofline is 89% of theoretical. Headroom is real.
+- Production q4 plateaus at 173–191 GB/s **regardless of whether its data
+  fits L2** — the cap is inside the kernel (register pressure at maxTotal=448,
+  spills and/or too few loads in flight), not the memory system.
+- **r2 is worse than production on M1 Max (143–154 vs 173–191)** — the
+  M4-era arm ranking does not transfer (consistent with the missing round
+  doc; recorded as upstream-report evidence).
+- Small shapes (3 MB) are ramp-bound (prod 86 GB/s at 30 µs); irrelevant to
+  the aggregate.
+- Projection if prod reaches ~80% of roofline (285 GB/s): matvec (65.5% of
+  decode) x0.65 time -> tg 11.5 -> ~15 (+30%); full roofline would be ~+45%.
+
 ## Pending / next (in order)
 
-1. **matvec_q4_quantized analysis** (approved direction): register/threadgroup
-   stats via now-installed Metal Toolchain (`xcrun metal -c … && xcrun
-   metal-objdump -d` or air stats), kernel read-pattern review on M1 Max, then
-   a modification proposal. Gate: golden digest + PPL before/after, plus
-   test-metal-ops.
+1. **matvec Step B — AWAITING USER GO after Step A** (Step A done above).
+   Planned split per user's 2026-09-23 note: B0 = bench-only incremental
+   arms (stream+x, stream+scales, …) to decompose where 356->185 GB/s is
+   lost; B1 = x broadcast via threadgroup memory (bit-identical expected,
+   gate = digest equality); B2 = row-pair interleave / prefetch restructuring
+   (reordering class, gate = golden_check margin rule). Never combine B1 and
+   B2 in one verification pass. Note: offline shader stats (air-stat etc.)
+   do NOT ship inside this Xcode — occupancy via runtime DIAG is the
+   available proxy.
 2. attention_f16 slope inefficiency (~3% of bandwidth) — first target after
    matvec; ~60% of decode time at 7K context is attention.
 3. Decide: commit current work (2 src files + tools + bench/m1max/), and/or
@@ -233,7 +264,10 @@ bench/m1max/
   logs/                          build, download, grid, profile, repro logs
 tools/
   bench_metal.cpp                pp/tg split bench, medians, memory+rws logging
-  golden_metal.cpp               golden + ppl harness
+  golden_metal.cpp               golden + ppl harness (+ --step-margins)
+  golden_check.py                reordering-class gate (root-margin + PPL)
+  roofline_m1.mm                 matvec roofline/arm harness (Step A)
+  bench_stream.metal             bench-only stream kernel (Step A)
   grid_m1.sh                     per-trial-timeout grid runner
 src/metal/
   metal_backend.mm               delta fallback wiring, diag logging, family GQA defaults
