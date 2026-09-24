@@ -1,0 +1,232 @@
+commit 7668547902dfb8ddf9efa5c65640d063f08fe5e1
+Author: user <user@example.invalid>
+Date:   Thu Sep 24 16:45:09 2026 +0900
+
+    m1max: session close — consolidated final state: shipped (matvec +26% bit-identical, prefill +47%, family GQA defaults), closed negatives (B1, double-buffer, u2, b128, w2row, SSM, idle-artifact), open-uncertain (B tail, prefill share), resume order, upstream-issue note, and the rebuild->strings->verify checklist
+
+diff --git a/bench/m1max/STATUS.md b/bench/m1max/STATUS.md
+index 73d5062..9cb2a3b 100644
+--- a/bench/m1max/STATUS.md
++++ b/bench/m1max/STATUS.md
+@@ -390,33 +390,31 @@ after all closures: the matvec busy stream itself (53.5ms, 72%): the old
+ B-tail (264->338 GB/s ceiling, ~+10% tg upper bound, uncertain) is the
+ only sizeable unexploited item on record.
+ 
+-## Pending / next (in order)
+-
+-0a. **INTEGRATION DECISION PENDING** — see B2a/B2c above.
+-0b. **(superseded) matvec Step B2 — AWAITING USER GO after B0** (see B0 section above):
+-   rewrite q27_dot8_q4 as an exact fp16 magic-number dot as a bench arm
+-   FIRST (`bench_sc_halfdot4`), measure at the same geometry; only then
+-   engine-integrate behind `Q27_METAL_Q4_ARM`. Gate stays digest-equality
+-   (the rewrite is mathematically bit-identical by construction).
+-1. **(superseded) matvec Step B — AWAITING USER GO after Step A** (Step A done above).
+-   Planned split per user's 2026-09-23 note: B0 = bench-only incremental
+-   arms (stream+x, stream+scales, …) to decompose where 356->185 GB/s is
+-   lost; B1 = x broadcast via threadgroup memory (bit-identical expected,
+-   gate = digest equality); B2 = row-pair interleave / prefetch restructuring
+-   (reordering class, gate = golden_check margin rule). Never combine B1 and
+-   B2 in one verification pass. Note: offline shader stats (air-stat etc.)
+-   do NOT ship inside this Xcode — occupancy via runtime DIAG is the
+-   available proxy.
+-2. attention_f16 slope inefficiency (~3% of bandwidth) — first target after
+-   matvec; ~60% of decode time at 7K context is attention.
+-3. Decide: commit current work (2 src files + tools + bench/m1max/), and/or
+-   derive metal-m1 canonical for `metal_canonical_gate.sh` (old-route digest
+-   `c30b2e89d450d563` and family-default 32/32 invariance are on disk to start from).
+-4. Deferred by agreement: turbo3 3-bit KV evaluation on M1; MTP/continuous-batch
+-   Metal-side effectiveness measurement (`matmul_q4_mm` 16.4% path); 512-vs-256
+-   delta cross-check (needs Apple8+ or CUDA machine); PPL with longer context.
+-5. For powermetrics runs alongside benches, user starts
+-   `sudo powermetrics --samplers gpu_power,cpu_power -i 1000` manually.
++## Session close state (2026-09-24) — everything above resolved or closed
++
++Shipped (all gates passed, docs in this directory):
++- decode tg +26% (lower bound): fp16 magic-number matvec dot default
++  (rollback Q27_METAL_Q4_ARM=r0); bit-identical, golden 64x2 x3 runs.
++- prefill pp +47%: q27_matmul_q4_mm_h default (rollback
++  Q27_METAL_GEMM_HALF_Q4=0); gate-substitution precedent recorded above.
++- GQA defaults family-aware (b256/threshold 1280 on Apple7), grid_m1 data.
++Negative results on record (do not retry without new evidence): matvec B1
++(x-broadcast), manual double-buffer (halfdot4p), 2-chunk unroll (u2),
++b128 grid (device-worse), w2row attention (tg-flat), SSM/GDN kernels
++(shadow, 2.7% ceiling), "GPU idle pool" (profiler artifact — never read
++busy/wall gap from Q27_METAL_PROFILE logs).
++Open but user-closed as "uncertain payoff, medium-large cost":
++- matvec B tail: 264->338 GB/s ceiling needs deep reformulation
++  (mantissa-direct / simdgroup_matrix); ~+10% tg upper bound.
++- prefill post-h4 share unprofiled (needs a harness that does NOT sample
++  per-encoder, or reads gaps only from clean runs).
++If resumed: user agreed prefill inventory first (momentum side), B tail
++second. Optional: share the M4-assumptions-dont-transfer corpus
++(DeltaNet thresholds, r2 arm, 1.7x gate, attention route data) upstream
++with signalnine as an issue — user suggestion, not started.
++Verification checklist for any kernel edit: rebuild tools -> strings | grep
++<kernel_name> -> ops -> golden(margins) -> clean tg/pp A/B (best-of-2;
++differences <2.5% are unmeasurable by this rig).
+ 
+ ## File map (new stuff this session)
+ 
+
+commit 4f3c35f2ba479c562aeb5da89a3d928462e13c6d
+Author: user <user@example.invalid>
+Date:   Thu Sep 24 16:23:02 2026 +0900
+
+    m1max ④ closed: GPU-idle pool was profiler artifact (~31ns x 1252 encoders = 38.4ms/token); greedy decode is saturated
+    
+    Clean tg 74.5ms vs profiled 112.9ms at seq2048 — the whole 'idle' gap is
+    Q27_METAL_PROFILE sampling overhead. Profile logs' busy/wall gap must not
+    be interpreted (shares still fine). Corrects the record from the w2row
+    entry. Adds Q27_SUFFIX_TRACE phase timing (output-only). Also corrects:
+    bench default is greedy serial; speculation paths are separate modes.
+    Structural lesson recorded: attention route swaps move tg while kernel-us
+    wins don't — dispatch structure, not kernel time, surfaces in wall time.
+
+diff --git a/bench/m1max/STATUS.md b/bench/m1max/STATUS.md
+index 93d4b83..73d5062 100644
+--- a/bench/m1max/STATUS.md
++++ b/bench/m1max/STATUS.md
+@@ -370,6 +370,26 @@ closed as tg lever without noop runs. Full decode shares recorded in
+ STATUS history; GPU busy 76.5 vs wall 112.9 => ~36ms/token idle pool
+ (possible next campaign; explains w2row absorption).
+ 
++## ④ CLOSED: the "36ms/token GPU idle" was a profiler artifact (2026-09-24)
++
++Recompute with clean numbers: unprofiled tg at seq2048 = 74.5ms/token; the
++Q27_METAL_PROFILE run measured 112.9ms/token tg. Difference 38.4ms over
++1252 sampled encoders/token = ~31ns/encoder of timestamp-sampling overhead
++— exactly the pool I had filed as "idle". There is NO idle pool: greedy
++decode is GPU-saturated (busy ~= wall). All prior shares from profile logs
++are directionally fine but their wall/busy GAP must not be interpreted.
++Also corrected: bench_metal default --mode greedy is a plain serial step
++loop (the printed width/min_match fields are display-only); suffix/MTP
++paths are separate modes. Q27_SUFFIX_TRACE=1 now emits per-round
++verify/read/commit phase walls (output-only instrumentation, this commit).
++Consequence for the attention puzzle (route swap moves tg 9% but the w2
++kernel -33% moves 0.3%): dispatch STRUCTURE (route, merge count, encoder
++serialization), not kernel microseconds, is what surfaces in wall time.
++If attention is chased again, chase structure. Remaining decode levers
++after all closures: the matvec busy stream itself (53.5ms, 72%): the old
++B-tail (264->338 GB/s ceiling, ~+10% tg upper bound, uncertain) is the
++only sizeable unexploited item on record.
++
+ ## Pending / next (in order)
+ 
+ 0a. **INTEGRATION DECISION PENDING** — see B2a/B2c above.
+diff --git a/src/metal/metal_engine.cpp b/src/metal/metal_engine.cpp
+index 77249d2..84a7047 100644
+--- a/src/metal/metal_engine.cpp
++++ b/src/metal/metal_engine.cpp
+@@ -3049,6 +3049,12 @@ uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint3
+             throw std::runtime_error("q27 Metal: suffix lane token out of range");
+     last_spec_stats_.rounds++;
+     last_spec_stats_.drafted += live - 1;
++    // Diagnostic phase timing (Q27_SUFFIX_TRACE): wall of each phase, to
++    // attribute decode-step GPU idle (m1max study). Output only.
++    static const bool s_trace = getenv("Q27_SUFFIX_TRACE") != nullptr &&
++                                *getenv("Q27_SUFFIX_TRACE") != '0';
++    auto s_clock = std::chrono::steady_clock::now;
++    const auto s_t0 = s_trace ? s_clock() : s_clock();
+     {
+         CommandBatch batch(backend_);
+         chunk_forward(lanes, live, /*verify=*/true);
+@@ -3059,6 +3065,8 @@ uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint3
+         backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
+         batch.finish();
+     }
++    const double s_verify = s_trace
++        ? std::chrono::duration<double>(s_clock() - s_t0).count() : 0.0;
+     std::vector<uint32_t> predictions(live);
+     backend_.read(*cpred_, 0, predictions.data(), live * sizeof(uint32_t));
+     uint32_t accepted = 0;
+@@ -3072,6 +3080,8 @@ uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint3
+             break;
+         }
+     last_spec_stats_.accepted += commit_n - 1;
++    const double s_pre_commit = s_trace
++        ? std::chrono::duration<double>(s_clock() - s_t0).count() : 0.0;
+     if (encoded) {
+         CommandBatch batch(backend_);
+         gdn_replay(encoded);
+@@ -3081,13 +3091,20 @@ uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint3
+                       *logits_, 0, (uint64_t)VOCAB * sizeof(float));
+         batch.finish();
+     }
++    const double s_commit = s_trace
++        ? std::chrono::duration<double>(s_clock() - s_t0).count() : 0.0;
+     position_ += encoded;
+     committed.insert(committed.end(), lanes, lanes + commit_n);
+     // Dispatch evidence for the width gates (vacuous-gate lesson): printed
+     // at the dispatch site, not the driver's bookkeeping.
+     static const bool trace = getenv("Q27_SUFFIX_TRACE") != nullptr;
+-    if (trace)
+-        fprintf(stderr, "suffix round: live %u accepted %u committed %u\n", live, accepted, commit_n);
++    if (trace || s_trace)
++        fprintf(stderr, "suffix round: live %u accepted %u committed %u%s",
++                live, accepted, commit_n,
++                s_trace ? "" : "\n");
++    if (s_trace)
++        fprintf(stderr, " | verify %.2fs read+accept %.4fs commit %.4fs\n",
++                s_verify, s_pre_commit - s_verify, s_commit - s_pre_commit);
+     return predictions[commit_n - 1];
+ }
+ 
+
+commit 39f94793ec6fbd86e6967339fd3ce8a70d3a751b
+Author: user <user@example.invalid>
+Date:   Thu Sep 24 16:09:46 2026 +0900
+
+    m1max: promote q4_mm_h to default prefill GEMM (pp 42.56 -> 62.5 t/s, +47%); rollback Q27_METAL_GEMM_HALF_Q4=0
+    
+    Post-promote spot check on the rebuilt binary (strings shows the kernel
+    name): ops green, pp default 62.48 / =0 42.56, golden step-margins vs base:
+    PASS (0.0548 single branch). STATUS.md records the gate-substitution
+    decision verbatim-for-precedent: legacy evidence-less 1.7x ship-line
+    replaced by this machine's own battery (PPL+margin+ops+quiet A/B), with the
+    caveat that 1.7x may have encoded non-speed intent flagged for revisit.
+
+diff --git a/bench/m1max/STATUS.md b/bench/m1max/STATUS.md
+index 851c086..93d4b83 100644
+--- a/bench/m1max/STATUS.md
++++ b/bench/m1max/STATUS.md
+@@ -352,8 +352,17 @@ same 8096 calls): 5319us -> 3386us avg = 1.57x. tg unchanged (decode uses
+ matvec). NOTE: the code gate says "ship pending valid >=1.7x quiet run" and
+ cites QUIET_BENCH_EVIDENCE.md, which is NOT in the repo (origin unclear,
+ likely another machine). M1 Max quiet numbers land at 1.47x pp / 1.57x
+-kernel: big win but BELOW the recorded 1.7x ship-line -> promotion is a
+-user decision, default stays OFF pending that call.
++kernel: big win but BELOW the recorded 1.7x ship-line -> promotion was a
++user decision. DECISION (user, 2026-09-24): PROMOTED to default. The legacy
++">=1.7x quiet" line is NOT adopted as this repo's bar: its evidence file is
++missing and it was likely a kernel-basis number measured on other hardware.
++Precedent recorded for future ship-lines that arrive without reproducible
++evidence: re-derive the gate on THIS machine from the project's own battery
++(PPL + golden step-margins + ops + quiet alternating A/B), and document the
++substitution here rather than silently inheriting or rejecting a number.
++Caveat kept on file: 1.7x may once have encoded intent beyond speed
++(compile time, margin headroom, maintenance); if such constraints ever
++matter, revisit under this entry. Rollback: Q27_METAL_GEMM_HALF_Q4=0.
+ 
+ ## SSM/GDN shadow (2026-09-24): decode profile diff gen96-gen8 at seq2048:
+ all GDN/SSM kernels sum to 3.0ms of 113ms wall = 2.7% <= noise floor;
+diff --git a/src/metal/metal_backend.mm b/src/metal/metal_backend.mm
+index 6407798..8bfadfb 100644
+--- a/src/metal/metal_backend.mm
++++ b/src/metal/metal_backend.mm
+@@ -742,6 +742,16 @@ void report_profile() {
+             impl_->x_to_half_t_p = make_pipeline(impl_->device, impl_->library, @"q27_x_int8_to_half_t");
+             if (const char* env = getenv("Q27_METAL_GEMM_HALF"); env && *env)
+                 impl_->gemm_half = strtoul(env, nullptr, 10) != 0;
++            // M1 Max (m1max 2026-09-24): q27_matmul_q4_mm_h PROMOTED to the
++            // default prefill GEMM. The legacy ship-line "valid >=1.7x quiet"
++            // (QUIET_BENCH_EVIDENCE.md, absent from this repo; plausibly a
++            // kernel-basis figure from another machine) is deliberately NOT
++            // applied — see bench/m1max/STATUS.md gate-replacement precedent.
++            // Our own gates on this machine: PPL |d|=0.0065<=0.02, golden
++            // step-margin 0.0548<=0.5, ops green, quiet pp 1.47x (62.5 vs
++            // 42.56 t/s), kernel 1.57x. Q27_METAL_GEMM_HALF_Q4=0 restores
++            // the float-staged q27_matmul_q4_mm.
++            impl_->gemm_half_q4 = true;
+             if (const char* env = getenv("Q27_METAL_GEMM_HALF_Q4"); env && *env)
+                 impl_->gemm_half_q4 = strtoul(env, nullptr, 10) != 0;
+         }

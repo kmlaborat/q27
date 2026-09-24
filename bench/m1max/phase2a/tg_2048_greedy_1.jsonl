@@ -1,0 +1,1 @@
+{"seq":2048,"gen":128,"reps":1,"mode":"greedy","width":4,"min_match":12,"stream_digest":"0x1d7941409a65fa52","ctx":8192,"kv":"fp16","pp_med":62.4463,"tg_med":13.5773,"pp_all":[62.4463],"tg_all":[13.5773],"load_s":6.80724,"rws":27917287424,"mem_internal":208404480,"mem_compressed":0,"hw_memsize":34359738368}

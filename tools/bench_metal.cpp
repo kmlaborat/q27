@@ -29,6 +29,7 @@
 #include <mach/mach.h>
 #include <string>
 #include <thread>
+#include <cstdlib>
 #include <vector>
 #include <algorithm>
 
@@ -64,6 +65,7 @@ int main(int argc, char** argv) try {
     int reps = 3;
     bool turbo3_kv = false;
     bool suffix_mode = false;
+    std::string prompt_file;
     bool chunked_prefill = true;
     std::vector<uint32_t> seqs = {128, 512, 1024, 2048, 4096};
     std::string out_path;
@@ -90,6 +92,7 @@ int main(int argc, char** argv) try {
         else if (a == "--mode") { auto m = need("--mode"); suffix_mode = (m == "suffix"); if (m != "greedy" && m != "suffix") throw std::runtime_error("--mode greedy|suffix"); }
         else if (a == "--width") width = (uint32_t)std::stoul(need("--width"));
         else if (a == "--min-match") min_match = (uint32_t)std::stoul(need("--min-match"));
+        else if (a == "--prompt-file") prompt_file = need("--prompt-file");
         else if (a == "--out") out_path = need("--out");
         else throw std::runtime_error("unknown arg " + a);
     }
@@ -104,12 +107,25 @@ int main(int argc, char** argv) try {
     fprintf(stderr, "device=%s recommendedMaxWorkingSetSize=%.2f GiB load=%.2f s\n",
             engine.backend().name().c_str(), rws / 1073741824.0, load_s);
 
+    // --prompt-file: tokenize a real-text corpus instead of the synthetic
+    // repeat paragraph (m1max Phase 2A: speculation gains are corpus-bound;
+    // code/diff/prose samples measure what real workloads would see).
     // Corpus prompt: repeat a real English paragraph until length N tokens.
     const std::string para =
         "The quick brown fox jumps over the lazy dog. Inference engines trade "
         "memory bandwidth for compute, and the scheduler hides the latency of "
         "weight streaming behind verification. Prefix reuse is the whole game. ";
     std::vector<int> base;
+    if (!prompt_file.empty()) {
+        std::FILE* pf = std::fopen(prompt_file.c_str(), "rb");
+        if (!pf) { fprintf(stderr, "prompt-file: cannot open %s\n", prompt_file.c_str()); return 1; }
+        std::fseek(pf, 0, SEEK_END); long sz = std::ftell(pf); std::rewind(pf);
+        std::string txt((size_t)sz, '\0');
+        if (std::fread(&txt[0], 1, (size_t)sz, pf) != (size_t)sz) { std::fclose(pf); return 1; }
+        std::fclose(pf);
+        base = tokenizer.encode(txt);
+        fprintf(stderr, "prompt-file: %zu tokens from %s\n", base.size(), prompt_file.c_str());
+    } else
     for (int n = 0; n < 200 && base.size() < 65536; n++) {
         auto enc = tokenizer.encode(para + std::to_string(n) + " ");
         base.insert(base.end(), enc.begin(), enc.end());
@@ -121,6 +137,8 @@ int main(int argc, char** argv) try {
         if (seq + gen + 8 > ctx) { fprintf(stderr, "skip seq=%u (ctx %u)\n", seq, ctx); continue; }
         std::vector<uint32_t> prompt(base.begin(), base.begin() + seq);
         std::vector<double> pp, tg;
+        uint64_t digest = 0;
+        uint64_t stats_rounds=0, stats_accepted=0, stats_burst=0, stats_fallback=0;
         for (int r = 0; r < reps; r++) {
             engine.reset();
             const double t0 = now_s();
@@ -129,6 +147,10 @@ int main(int argc, char** argv) try {
             uint32_t tok = engine.step(prompt.back());  // first decode token
             (void)tok;
             const double t2 = now_s();
+            // Speculation-equivalence digest (m1max Phase 2A): committed id
+            // stream must match the greedy stream token-for-token across any
+            // width/min_match config. FNV-1a over exactly gen-1 ids.
+            std::vector<uint32_t> dstream;
             if (suffix_mode) {
                 // Mirror generate_suffix(): drafter appends happen inside suffix_step.
                 std::vector<int> history(prompt.begin(), prompt.end());
@@ -141,11 +163,29 @@ int main(int argc, char** argv) try {
                 while (produced < gen - 1) {
                     pending = engine.suffix_step(drafter, pending, gen - produced,
                                                  UINT32_MAX, width, min_match, committed);
+                    dstream.insert(dstream.end(), committed.begin(), committed.end());
                     produced += (uint32_t)committed.size();
                 }
+                if (dstream.empty()) dstream.push_back(tok);
+                const auto ss = engine.last_suffix_stats();
+                stats_burst += ss.burst_rounds; stats_fallback += ss.fallback_rounds;
+                while (dstream.size() < gen - 1 && dstream.back() != pending)
+                    dstream.push_back(pending);
             } else {
-                for (uint32_t g = 1; g < gen; g++) tok = engine.step(tok);
+                dstream.push_back(tok);
+                for (uint32_t g = 1; g < gen; g++) { tok = engine.step(tok); dstream.push_back(tok); }
+                dstream.pop_back();  // same length basis as suffix: gen-1 ids
             }
+            if (dstream.size() > gen - 1) dstream.resize(gen - 1);
+            const auto sp = engine.last_spec_stats();
+            stats_rounds += sp.rounds; stats_accepted += sp.accepted;
+            if (getenv("Q27_BENCH_DUMPIDS")) {
+                fprintf(stderr, "ids %zu:", dstream.size());
+                for (uint32_t id : dstream) fprintf(stderr, " %u", id);
+                fprintf(stderr, "\n");
+            }
+            digest = 1469598103934665603ull;
+            for (uint32_t id : dstream) { digest ^= id; digest *= 1099511628211ull; }
             const double t3 = now_s();
             pp.push_back(seq / (t1 - t0));
             tg.push_back((gen - 1) / (t3 - t2));
@@ -158,7 +198,10 @@ int main(int argc, char** argv) try {
         out << "{\"seq\":" << seq << ",\"gen\":" << gen << ",\"reps\":" << reps
             << ",\"mode\":\"" << (suffix_mode ? "suffix" : "greedy") << "\""
             << ",\"width\":" << width << ",\"min_match\":" << min_match
-            << ",\"ctx\":" << ctx << ",\"kv\":\"" << (turbo3_kv ? "turbo3" : "fp16") << "\""
+            << ",\"rounds\":" << stats_rounds << ",\"accepted\":" << stats_accepted
+            << ",\"burst\":" << stats_burst << ",\"fallback\":" << stats_fallback
+            << ",\"stream_digest\":\"0x" << std::hex << digest << std::dec
+            << "\"" ",\"ctx\":" << ctx << ",\"kv\":\"" << (turbo3_kv ? "turbo3" : "fp16") << "\""
             << ",\"pp_med\":" << mpp << ",\"tg_med\":" << mtg
             << ",\"pp_all\":[";
         for (size_t k = 0; k < pp.size(); k++) out << (k ? "," : "") << pp[k];

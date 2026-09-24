@@ -1,0 +1,458 @@
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+
+#include <CommonCrypto/CommonDigest.h>
+#include "metal_backend.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <map>
+#include <stdexcept>
+#include <mach-o/dyld.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <vector>
+
+namespace q27 {
+namespace {
+
+class MetalBuffer final : public BackendBuffer {
+  public:
+    explicit MetalBuffer(id<MTLBuffer> buffer, bool writable = true)
+        : buffer_(buffer), writable_(writable) {}
+    uint64_t size() const override { return (uint64_t)buffer_.length; }
+    id<MTLBuffer> handle() const { return buffer_; }
+    bool writable() const { return writable_; }
+
+  private:
+    id<MTLBuffer> buffer_;
+    bool writable_;
+};
+
+MetalBuffer& metal_buffer(BackendBuffer& buffer) {
+    auto* result = dynamic_cast<MetalBuffer*>(&buffer);
+    if (!result) throw std::runtime_error("q27 Metal: buffer belongs to another backend");
+    if (!result->writable()) throw std::runtime_error("q27 Metal: buffer is read-only");
+    return *result;
+}
+
+const MetalBuffer& metal_buffer(const BackendBuffer& buffer) {
+    auto* result = dynamic_cast<const MetalBuffer*>(&buffer);
+    if (!result) throw std::runtime_error("q27 Metal: buffer belongs to another backend");
+    return *result;
+}
+
+const MetalBuffer& metal_buffer_view(const std::shared_ptr<BackendBuffer>& buffer) {
+    if (!buffer) throw std::runtime_error("q27 Metal: missing buffer");
+    return metal_buffer(static_cast<const BackendBuffer&>(*buffer));
+}
+
+const MetalBuffer& tensor_data(const BackendTensor& tensor, DType dtype, const char* operation) {
+    if (tensor.dtype != dtype || !tensor.data)
+        throw std::runtime_error(std::string("q27 Metal: invalid tensor for ") + operation);
+    return metal_buffer_view(tensor.data);
+}
+
+void check_range(uint64_t size, uint64_t offset, uint64_t bytes, const char* operation) {
+    if (offset > size || bytes > size - offset)
+        throw std::runtime_error(std::string("q27 Metal: buffer range error in ") + operation);
+}
+
+// Bounds a tensor access by its logical extent, not just its buffer: shared
+// whole-mapping buffers would otherwise let a per-tensor byte-count error
+// read silently into the neighboring tensor.
+uint64_t tensor_limit(uint64_t buffer_size, uint64_t offset, uint64_t logical_size) {
+    if (!logical_size) return buffer_size;
+    const uint64_t end = offset > UINT64_MAX - logical_size ? UINT64_MAX : offset + logical_size;
+    return end < buffer_size ? end : buffer_size;
+}
+
+uint64_t checked_mul(uint64_t a, uint64_t b, const char* operation) {
+    if (a && b > UINT64_MAX / a)
+        throw std::runtime_error(std::string("q27 Metal: size overflow in ") + operation);
+    return a * b;
+}
+
+// Must match the "Q27_SHADER_ABI" tag in q27_kernels.metal. Shaders compile
+// from that file at runtime, so a host binary built before a buffer-binding
+// change would otherwise misbind silently against a newer shader file.
+constexpr const char* kShaderAbiTag = "// Q27_SHADER_ABI 13";
+
+std::string source_sha1(NSString* source) {
+    NSData* data=[source dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1(data.bytes,(CC_LONG)data.length,digest);
+    static const char hex[]="0123456789abcdef";
+    std::string out(40,'0');
+    for(int i=0;i<CC_SHA1_DIGEST_LENGTH;i++) {
+        out[2*i]=hex[digest[i]>>4]; out[2*i+1]=hex[digest[i]&15];
+    }
+    return out;
+}
+
+NSString* source_tree_shader_path() {
+    uint32_t size = 0;
+    (void)_NSGetExecutablePath(nullptr, &size);
+    if (!size) return nil;
+    std::vector<char> path(size);
+    if (_NSGetExecutablePath(path.data(), &size) != 0) return nil;
+    NSString* executable = [NSString stringWithUTF8String:path.data()];
+    if (!executable) return nil;
+    executable = executable.stringByStandardizingPath;
+    NSString* checkout = [[executable stringByDeletingLastPathComponent]
+                                      stringByDeletingLastPathComponent];
+    return [checkout stringByAppendingPathComponent:@"src/metal/q27_kernels.metal"];
+}
+
+NSString* load_kernel_source() {
+    NSFileManager* files = [NSFileManager defaultManager];
+    NSMutableArray<NSString*>* candidates = [NSMutableArray array];
+    if (const char* override_path = getenv("Q27_METAL_SOURCE"))
+        [candidates addObject:[NSString stringWithUTF8String:override_path]];
+#ifdef Q27_SHADER_PATH
+    // Installed binaries trust the share-dir shader baked in at build time.
+    // A source file in the process working directory must not override it;
+    // intentional overrides remain explicit through Q27_METAL_SOURCE.
+    [candidates addObject:@Q27_SHADER_PATH];
+#else
+    // Source-tree binaries live under build/. Resolve from the executable so
+    // invoking them outside the checkout does not depend on process cwd.
+    if (NSString* path = source_tree_shader_path()) [candidates addObject:path];
+    // Preserve direct compiler/test invocations that do not place the binary
+    // under the checkout's build directory.
+    [candidates addObject:@"src/metal/q27_kernels.metal"];
+#endif
+
+    for (NSString* path in candidates) {
+        if (![files fileExistsAtPath:path]) continue;
+        NSError* error = nil;
+        NSString* source = [NSString stringWithContentsOfFile:path
+                                                      encoding:NSUTF8StringEncoding
+                                                         error:&error];
+        if (!source)
+            throw std::runtime_error("q27 Metal: cannot read shader source: " +
+                                     std::string(error.localizedDescription.UTF8String));
+        // Match the tag as a complete logical line (any line ending), so
+        // ABI 2 does not accept ABI 20 and CRLF sources still load.
+        bool tag_found = false;
+        for (NSString* line in [source componentsSeparatedByCharactersInSet:
+                                           NSCharacterSet.newlineCharacterSet])
+            if ([[line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]
+                    isEqualToString:@(kShaderAbiTag)]) { tag_found = true; break; }
+        if (!tag_found)
+            throw std::runtime_error(std::string("q27 Metal: shader ABI mismatch: ") +
+                                     path.UTF8String + " does not carry \"" + kShaderAbiTag +
+                                     "\"; rebuild this binary against the current shader source");
+        return source;
+    }
+    throw std::runtime_error("q27 Metal: shader source not found (set Q27_METAL_SOURCE)");
+}
+
+id<MTLComputePipelineState> make_pipeline(id<MTLDevice> device, id<MTLLibrary> library,
+                                          NSString* name) {
+    id<MTLFunction> function = [library newFunctionWithName:name];
+    if (!function)
+        throw std::runtime_error("q27 Metal: shader function not found: " +
+                                 std::string(name.UTF8String));
+    NSError* error = nil;
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function
+                                                                                  error:&error];
+    if (!pipeline)
+        throw std::runtime_error("q27 Metal: pipeline creation failed for " +
+                                 std::string(name.UTF8String) + ": " +
+                                 std::string(error.localizedDescription.UTF8String));
+    if (pipeline.threadExecutionWidth != 32 || pipeline.maxTotalThreadsPerThreadgroup < 256)
+        throw std::runtime_error("q27 Metal: matvec requires simd width 32 and 256-thread groups");
+    // Q27_METAL_DIAG: occupancy audit for the M1 Max tuning pass. Apple
+    // quantizes maxTotalThreadsPerThreadgroup to the per-thread register cost;
+    // q27_delta_step holds a float saved[32] frame (~>64 regs/thread), which
+    // caps below 512 threads on Apple7 (M1) cores while Apple8+ clears it.
+    // Logging the real numbers separates that register-pressure hypothesis
+    // (b) from threadgroup-memory limits (a: the delta kernels allocate only
+    // 3.5KB of threadgroup memory, far under M1's 32KB, so (a) is ruled out
+    // from the source) and any hard Apple7 ceiling (c: M1 reports
+    // maxThreadsPerThreadgroup 1024-2048 generally, so 512 is physically
+    // launchable -- the cap is the pipeline's register cost, not the GPU).
+    if (getenv("Q27_METAL_DIAG"))
+        fprintf(stderr, "q27 metal diag: %s execWidth=%lu maxTotal=%lu\n",
+                name.UTF8String, (unsigned long)pipeline.threadExecutionWidth,
+                (unsigned long)pipeline.maxTotalThreadsPerThreadgroup);
+    return pipeline;
+}
+
+// Threadgroup widths are pinned by kernel-side contracts.
+// kTurboThreads: the turbo3 WHT/KV-store kernels' butterfly barriers are only
+// well-formed at exactly 128 threads. kReduceThreads: the per-head attention
+// merge trees hardcode 8 simdgroup partials, the rmsnorm quantize strides
+// walk block += 8, and q27_l2norm_rows passes a literal 8 to reduce_sum —
+// all assume kReduceThreads/32 == 8. Changing either width means changing
+// those kernels in lockstep.
+constexpr uint32_t kTurboThreads = 128;
+constexpr uint32_t kReduceThreads = 256;
+
+struct MatvecArgs {
+    uint32_t rows;
+    uint32_t cols;
+};
+struct MatvecPairArgs { uint32_t rows_a, rows_b, cols; };
+struct MatmulArgs { uint32_t rows,cols,x_rows,simdgroups; };
+struct VectorArgs { uint32_t n, groups; float eps; };
+struct HeadArgs { uint32_t heads, head_dim, stride, groups; float eps; };
+struct GateArgs { uint32_t heads, head_dim; };
+struct ConcatArgs { uint32_t a_count, b_count; };
+struct RopeArgs { uint32_t heads, head_dim, n_rot, stride, position; float freq_base; };
+struct KvStoreArgs { uint32_t position, row_length; };
+struct TurboWhtArgs { uint32_t heads, stride, inverse; };
+struct TurboStoreArgs { uint32_t position, kv_heads; };
+struct AttentionArgs { uint32_t q_stride, seq_len, q_heads, kv_heads, head_dim; float scale; };
+struct AttentionGqaArgs { uint32_t q_stride, seq_len, q_heads, kv_heads, head_dim, block, n_blocks; float scale; };
+struct AttentionGqaCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, block, n_blocks_max, tokens; float scale; };
+struct TopkArgs { uint32_t n, k, capacity; };
+struct DeltaArgs { uint32_t value_heads, qk_heads, head_dim; };
+struct EmbedRowsArgs { uint32_t cols, count, tokens[96]; };
+struct RowsNormArgs { uint32_t n, rows, groups; float eps; };
+struct MatvecPairRowsArgs { uint32_t rows_a, rows_b, cols, tokens; };
+struct GatesRowsArgs { uint32_t heads, tokens; };
+struct ConvChunkArgs { uint32_t channels, tokens; };
+struct DeltaChunkArgs { uint32_t value_heads, qk_heads, head_dim, tokens; };
+struct L2RowsArgs { uint32_t heads, head_dim, row_stride, tokens; float eps; };
+struct RopeRowsArgs { uint32_t heads, head_dim, n_rot, stride, row_stride, position, tokens; float freq_base; };
+struct KvStoreRowsArgs { uint32_t position, row_length, tokens; };
+struct TurboStoreRowsArgs { uint32_t position, kv_heads, tokens; };
+struct TurboAttribArgs { uint32_t position, kv_heads, tokens, mode, head, flags, scale_off; };
+struct GateRowsArgs { uint32_t heads, head_dim, tokens; };
+struct ArgmaxRowsArgs { uint32_t n, rows; };
+struct AttentionCausalArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens; float scale; };
+struct AttentionCausalWinArgs { uint32_t q_stride, q_row_stride, base_len, q_heads, kv_heads, head_dim, tokens, out_row_stride; float scale; };
+struct KvStoreHeadRowsArgs { uint32_t position, src_stride, row_length, tokens, codec; };
+
+} // namespace
+
+struct MetalBackend::Impl {
+    std::string shader_hash;
+    id<MTLDevice> device;
+    id<MTLCommandQueue> queue;
+    id<MTLLibrary> library;
+    id<MTLComputePipelineState> f32;
+    id<MTLComputePipelineState> f16;
+    id<MTLComputePipelineState> q8;
+    id<MTLComputePipelineState> q4;
+    id<MTLComputePipelineState> t2;
+    id<MTLComputePipelineState> t3;
+    id<MTLComputePipelineState> b1;
+    id<MTLComputePipelineState> t2_quantized_matmul_h;
+    id<MTLComputePipelineState> q4_quantized_matmul_h;
+    id<MTLComputePipelineState> mask_logits_p;
+    // Half-staging chunk GEMMs: default ON (T2 landed at 1.22x chunk rate at
+    // quality parity — the GEMM envelope class, docs/plans/2026-07-15-
+    // margin-aware-gates.md); Q27_METAL_GEMM_HALF=0 opts out and exactly
+    // reproduces the float-staged routes (used to attribute the kl-kv
+    // calibration shift to the digit, 2026-07-16-kv-codec-step1.md).
+    bool gemm_half = true;
+    // Q4 half port remains probe-only pending a valid quiet gate
+    // (2026-07-17-t2-prefill-throughput.md asks >=1.7x). The 0.855 run was
+    // forced with idle>=0 and is explicitly rejected in
+    // logs/q4port-20260717/QUIET_BENCH_EVIDENCE.md. Correctness-gated;
+    // never the default until a valid quiet run clears the ship line.
+    bool gemm_half_q4 = false;
+    id<MTLComputePipelineState> quantize;
+    id<MTLComputePipelineState> q8_quantized;
+    id<MTLComputePipelineState> q4_quantized;
+    id<MTLComputePipelineState> t2_quantized;
+    id<MTLComputePipelineState> b1_quantized;
+    id<MTLComputePipelineState> t2_quantized_x2;
+    id<MTLComputePipelineState> t2_x2;
+    id<MTLComputePipelineState> f16_pair;
+    id<MTLComputePipelineState> q4_quantized_matmul;
+    id<MTLComputePipelineState> q8_quantized_matmul;
+    id<MTLComputePipelineState> t2_quantized_matmul;
+    id<MTLComputePipelineState> b1_quantized_matmul;
+    id<MTLComputePipelineState> embedding;
+    id<MTLComputePipelineState> embedding_t2;
+    id<MTLComputePipelineState> embedding_b1;
+    id<MTLComputePipelineState> embedding_dev;
+    id<MTLComputePipelineState> embedding_t2_dev;
+    id<MTLComputePipelineState> embedding_b1_dev;
+    id<MTLComputePipelineState> embedding_t2_rows;
+    id<MTLComputePipelineState> embedding_b1_rows;
+    id<MTLComputePipelineState> rms;
+    id<MTLComputePipelineState> rms_quantized;
+    id<MTLComputePipelineState> rms_heads;
+    id<MTLComputePipelineState> l2_heads;
+    id<MTLComputePipelineState> silu;
+    id<MTLComputePipelineState> add;
+    id<MTLComputePipelineState> concat;
+    id<MTLComputePipelineState> copy_bytes;
+    id<MTLComputePipelineState> sigmoid_gate;
+    id<MTLComputePipelineState> rope;
+    id<MTLComputePipelineState> argmax;
+    id<MTLComputePipelineState> kv_store;
+    id<MTLComputePipelineState> turbo_wht;
+    id<MTLComputePipelineState> kv_store_turbo3;
+    id<MTLComputePipelineState> attention_turbo3;
+    id<MTLComputePipelineState> attention;
+    id<MTLComputePipelineState> gates;
+    id<MTLComputePipelineState> conv;
+    id<MTLComputePipelineState> delta;
+    id<MTLComputePipelineState> gated_norm;
+    id<MTLComputePipelineState> embedding_rows;
+    id<MTLComputePipelineState> rms_rows_quantized;
+    id<MTLComputePipelineState> f16_pair_rows;
+    id<MTLComputePipelineState> gates_rows;
+    id<MTLComputePipelineState> conv_chunked;
+    id<MTLComputePipelineState> delta_chunked;
+    // 256-thread fallbacks, selected at dispatch time when the 512-thread
+    // originals report sub-512 occupancy on this GPU (M1 Max: 448). See
+    // q27_kernels.metal for the contract.
+    id<MTLComputePipelineState> delta256;
+    id<MTLComputePipelineState> delta_chunked256;
+    id<MTLComputePipelineState> l2_rows;
+    id<MTLComputePipelineState> rope_rows;
+    id<MTLComputePipelineState> kv_store_rows;
+    id<MTLComputePipelineState> kv_store_turbo3_rows;
+    id<MTLComputePipelineState> kv_store_attrib_rows;
+    id<MTLBuffer> attrib_dummy;
+    id<MTLComputePipelineState> attention_causal;
+    id<MTLComputePipelineState> attention_causal_win;
+    id<MTLComputePipelineState> kv_store_head_rows;
+    id<MTLComputePipelineState> attention_turbo3_causal_p;
+    id<MTLComputePipelineState> sigmoid_gate_rows;
+    id<MTLComputePipelineState> argmax_rows_p;
+    id<MTLComputePipelineState> nll_rows_p;
+    id<MTLComputePipelineState> attention_f16_gqa_p;
+    id<MTLComputePipelineState> attention_turbo3_gqa_p;
+    // Two-rows-per-tile variant (Q27_METAL_ATT=w2); nil = route disabled.
+    id<MTLComputePipelineState> attention_turbo3_gqa_w2_p;
+    id<MTLComputePipelineState> attention_gqa_merge_p;
+    id<MTLComputePipelineState> attention_f16_causal_gqa_p;
+    id<MTLComputePipelineState> attention_turbo3_causal_gqa_p;
+    id<MTLComputePipelineState> attention_gqa_merge_rows_p;
+    // R1b token-tiled causal GQA (t2 = production route, t4 + hm = bench).
+    id<MTLComputePipelineState> attention_turbo3_gqa_hm_p;
+    id<MTLComputePipelineState> attention_turbo3_causal_gqa_t2_p;
+    id<MTLComputePipelineState> attention_turbo3_causal_gqa_t4_p;
+    id<MTLComputePipelineState> attention_turbo3_causal_gqa_bf2_p;
+    id<MTLComputePipelineState> mma_roofline_a_p;
+    id<MTLComputePipelineState> mma_roofline_b_p;
+    id<MTLComputePipelineState> mma_roofline_b_eq_p;
+    id<MTLComputePipelineState> mma_roofline_cx_p;
+    id<MTLComputePipelineState> mma_roofline_f_p;
+    id<MTLComputePipelineState> b1_select_p;
+    id<MTLComputePipelineState> b1_signxor_p;
+    id<MTLComputePipelineState> b1_popcount_p;
+    id<MTLComputePipelineState> b1_x_prep_p;
+    // Q4-round retained comparison arm (bench-only): built on first
+    // matvec_q4_probe use (the roofline-k pattern), so production startup
+    // never creates it. r4 was promoted into q4_quantized; the q8 twin was
+    // killed by measurement (2026-07-17 round doc).
+    id<MTLComputePipelineState> q4_r2_p;
+    // B1 round-2 retained 8-row arm (bench-only): built on first
+    // matvec_b1r2_probe use, same lazy pattern as q4_r2_p above. The 4-row
+    // r2 arm was promoted into b1_quantized (2026-07-17 round).
+    id<MTLComputePipelineState> b1_r3_p;
+    // Arm K (function-constant probe): one specialized PSO per baked cols.
+    std::map<uint32_t, id<MTLComputePipelineState>> mma_roofline_k_p;
+    id<MTLComputePipelineState> mm_dr_p;
+    id<MTLComputePipelineState> mm_dr2_p;
+    id<MTLComputePipelineState> x_to_half_t_p;
+    id<MTLBuffer> dr_xt_scratch;
+    id<MTLComputePipelineState> attention_f16_causal_gqa_t2_p;
+    // Q27_METAL_GQA_TILE: causal token-tile factor, 1 (untiled A/B lever)
+    // or 2 (default; docs/plans/2026-07-15-cache-block-scheduling.md R1b).
+    uint32_t gqa_tile = 2;
+    // Q27_METAL_GQA_BLOCK: positions per (kvh, block) threadgroup. Default
+    // 1024; smaller blocks trade merge work for threadgroup count — the
+    // occupancy lever the latency-bound Phase-0 finding points at. Changing
+    // it changes the merge fold order (margin-aware-gates contract class),
+    // and chunk↔decode parity holds at any single value.
+    uint32_t gqa_block = 1024;
+    id<MTLComputePipelineState> topk_logits_p;
+    id<MTLCommandBuffer> command;
+    id<MTLComputeCommandEncoder> encoder;
+    bool batching = false;
+    // A failed committed command may already have mutated device state. The
+    // shared backend is then unrecoverable: every attached engine must be
+    // discarded and rebuilt from a fresh model mapping.
+    std::atomic<bool> poisoned{false};
+
+    void require_healthy() const {
+        if (poisoned.load(std::memory_order_acquire))
+            throw std::runtime_error("q27 Metal: backend is poisoned after a command failure; recreate the engine");
+    }
+
+    // Model mappings that fit maxBufferLength are wrapped as a single
+    // MTLBuffer (tensors bind at offsets), and on macOS 15+ that buffer joins
+    // a residency set attached to the queue. requestResidency is preparatory
+    // and best-effort per Apple (steps may be postponed under system load),
+    // not a hard wire: in practice it faults pages in at load and makes
+    // eviction under mid-run pressure far less likely.
+    std::map<const void*, std::weak_ptr<MetalBuffer>> model_wraps;
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+    API_AVAILABLE(macos(15.0)) id<MTLResidencySet> residency_set;
+#endif
+
+    // GQA KV-reuse decode attention: sequences at or beyond the threshold
+    // route to the blocked kernels that read each KV row once for all
+    // q_heads/kv_heads query heads. 0 disables; 1 forces every sequence
+    // (parity testing). The block partials scratch is caller-owned (each
+    // engine allocates its own at construction — audit E2), GPU-private,
+    // and only bounds-checked here: no growth on the hot path (audit C3).
+    uint32_t gqa_threshold = 2048;
+
+    void attention_gqa_dispatch(bool turbo3, const MetalBuffer& qb, uint32_t q_stride,
+                                const MetalBuffer& kc, const MetalBuffer& vc,
+                                MetalBuffer& output, uint32_t seq_len, uint32_t q_heads,
+                                uint32_t kv_heads, uint32_t head_dim, float scale,
+                                MetalBuffer& gqa_partials) {
+        const uint32_t block = gqa_block;
+        const uint32_t n_blocks = 1 + (seq_len - 1) / block;   // seq_len >= 1 host-checked
+        const uint32_t gqa = q_heads / kv_heads;
+        const uint64_t partial_bytes = (uint64_t)q_heads * n_blocks * 258 * 4;
+        if (gqa_partials.size() < partial_bytes)
+            throw std::runtime_error("q27 Metal: GQA partials buffer too small "
+                                     "(engine-owned, sized at construction)");
+        AttentionGqaArgs args{q_stride, seq_len, q_heads, kv_heads, head_dim,
+                              block, n_blocks, scale};
+        @autoreleasepool {
+            bool own;
+            auto enc = encoder_for_operation(own, turbo3 ? "q27_attention_turbo3_gqa"
+                                                         : "q27_attention_f16_gqa");
+            id<MTLComputePipelineState> gqa_p = turbo3 ? attention_turbo3_gqa_p : attention_f16_gqa_p;
+            if (turbo3 && attention_turbo3_gqa_w2_p) gqa_p = attention_turbo3_gqa_w2_p;
+            [enc setComputePipelineState:gqa_p];
+            [enc setBuffer:qb.handle() offset:0 atIndex:0];
+            [enc setBuffer:kc.handle() offset:0 atIndex:1];
+            [enc setBuffer:vc.handle() offset:0 atIndex:2];
+            [enc setBuffer:gqa_partials.handle() offset:0 atIndex:3];
+            [enc setBytes:&args length:sizeof(args) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(kv_heads, n_blocks, 1)
+                threadsPerThreadgroup:MTLSizeMake((NSUInteger)gqa * 32, 1, 1)];
+            // The merge consumes device writes from the producer dispatch.
+            // Dispatches inside one compute encoder are not ordered by tracked
+            // resource hazards, so make that dependency explicit.
+            id<MTLResource> partial_resources[] = { gqa_partials.handle() };
+            [enc memoryBarrierWithResources:partial_resources count:1];
+            [enc setComputePipelineState:attention_gqa_merge_p];
+            [enc setBuffer:gqa_partials.handle() offset:0 atIndex:0];
+            [enc setBuffer:output.handle() offset:0 atIndex:1];
+            [enc setBytes:&args length:sizeof(args) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(q_heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            if (own) finish_command("GQA attention");
+        }
+    }
+
+    void attention_gqa_causal_dispatch(bool turbo3, const MetalBuffer& qb, uint32_t q_stride,
+                                       uint32_t q_row_stride, const MetalBuffer& kc,
+                                       const MetalBuffer& vc, MetalBuffer& output,
+                                       uint32_t base_len, uint32_t q_heads, uint32_t kv_heads,
+                                       uint32_t head_dim, uint32_t tokens, float scale,
+                                       uint64_t q_byte_offset, uint64_t out_byte_offset,
+                                       MetalBuffer& gqa_partials) {
+        const uint32_t block = gqa_block;
+        const uint32_t max_seq = base_len + tokens - 1;     // overflo
