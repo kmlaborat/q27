@@ -370,6 +370,26 @@ closed as tg lever without noop runs. Full decode shares recorded in
 STATUS history; GPU busy 76.5 vs wall 112.9 => ~36ms/token idle pool
 (possible next campaign; explains w2row absorption).
 
+## ④ CLOSED: the "36ms/token GPU idle" was a profiler artifact (2026-09-24)
+
+Recompute with clean numbers: unprofiled tg at seq2048 = 74.5ms/token; the
+Q27_METAL_PROFILE run measured 112.9ms/token tg. Difference 38.4ms over
+1252 sampled encoders/token = ~31ns/encoder of timestamp-sampling overhead
+— exactly the pool I had filed as "idle". There is NO idle pool: greedy
+decode is GPU-saturated (busy ~= wall). All prior shares from profile logs
+are directionally fine but their wall/busy GAP must not be interpreted.
+Also corrected: bench_metal default --mode greedy is a plain serial step
+loop (the printed width/min_match fields are display-only); suffix/MTP
+paths are separate modes. Q27_SUFFIX_TRACE=1 now emits per-round
+verify/read/commit phase walls (output-only instrumentation, this commit).
+Consequence for the attention puzzle (route swap moves tg 9% but the w2
+kernel -33% moves 0.3%): dispatch STRUCTURE (route, merge count, encoder
+serialization), not kernel microseconds, is what surfaces in wall time.
+If attention is chased again, chase structure. Remaining decode levers
+after all closures: the matvec busy stream itself (53.5ms, 72%): the old
+B-tail (264->338 GB/s ceiling, ~+10% tg upper bound, uncertain) is the
+only sizeable unexploited item on record.
+
 ## Pending / next (in order)
 
 0a. **INTEGRATION DECISION PENDING** — see B2a/B2c above.

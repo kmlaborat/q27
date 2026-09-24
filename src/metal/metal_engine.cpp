@@ -3049,6 +3049,12 @@ uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint3
             throw std::runtime_error("q27 Metal: suffix lane token out of range");
     last_spec_stats_.rounds++;
     last_spec_stats_.drafted += live - 1;
+    // Diagnostic phase timing (Q27_SUFFIX_TRACE): wall of each phase, to
+    // attribute decode-step GPU idle (m1max study). Output only.
+    static const bool s_trace = getenv("Q27_SUFFIX_TRACE") != nullptr &&
+                                *getenv("Q27_SUFFIX_TRACE") != '0';
+    auto s_clock = std::chrono::steady_clock::now;
+    const auto s_t0 = s_trace ? s_clock() : s_clock();
     {
         CommandBatch batch(backend_);
         chunk_forward(lanes, live, /*verify=*/true);
@@ -3059,6 +3065,8 @@ uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint3
         backend_.argmax_rows(*clogits_, VOCAB, live, *cpred_);
         batch.finish();
     }
+    const double s_verify = s_trace
+        ? std::chrono::duration<double>(s_clock() - s_t0).count() : 0.0;
     std::vector<uint32_t> predictions(live);
     backend_.read(*cpred_, 0, predictions.data(), live * sizeof(uint32_t));
     uint32_t accepted = 0;
@@ -3072,6 +3080,8 @@ uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint3
             break;
         }
     last_spec_stats_.accepted += commit_n - 1;
+    const double s_pre_commit = s_trace
+        ? std::chrono::duration<double>(s_clock() - s_t0).count() : 0.0;
     if (encoded) {
         CommandBatch batch(backend_);
         gdn_replay(encoded);
@@ -3081,13 +3091,20 @@ uint32_t MetalEngine::suffix_round(uint32_t remaining, uint32_t eos, const uint3
                       *logits_, 0, (uint64_t)VOCAB * sizeof(float));
         batch.finish();
     }
+    const double s_commit = s_trace
+        ? std::chrono::duration<double>(s_clock() - s_t0).count() : 0.0;
     position_ += encoded;
     committed.insert(committed.end(), lanes, lanes + commit_n);
     // Dispatch evidence for the width gates (vacuous-gate lesson): printed
     // at the dispatch site, not the driver's bookkeeping.
     static const bool trace = getenv("Q27_SUFFIX_TRACE") != nullptr;
-    if (trace)
-        fprintf(stderr, "suffix round: live %u accepted %u committed %u\n", live, accepted, commit_n);
+    if (trace || s_trace)
+        fprintf(stderr, "suffix round: live %u accepted %u committed %u%s",
+                live, accepted, commit_n,
+                s_trace ? "" : "\n");
+    if (s_trace)
+        fprintf(stderr, " | verify %.2fs read+accept %.4fs commit %.4fs\n",
+                s_verify, s_pre_commit - s_verify, s_commit - s_pre_commit);
     return predictions[commit_n - 1];
 }
 
