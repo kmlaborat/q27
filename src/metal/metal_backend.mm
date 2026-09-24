@@ -742,6 +742,16 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
             impl_->x_to_half_t_p = make_pipeline(impl_->device, impl_->library, @"q27_x_int8_to_half_t");
             if (const char* env = getenv("Q27_METAL_GEMM_HALF"); env && *env)
                 impl_->gemm_half = strtoul(env, nullptr, 10) != 0;
+            // M1 Max (m1max 2026-09-24): q27_matmul_q4_mm_h PROMOTED to the
+            // default prefill GEMM. The legacy ship-line "valid >=1.7x quiet"
+            // (QUIET_BENCH_EVIDENCE.md, absent from this repo; plausibly a
+            // kernel-basis figure from another machine) is deliberately NOT
+            // applied — see bench/m1max/STATUS.md gate-replacement precedent.
+            // Our own gates on this machine: PPL |d|=0.0065<=0.02, golden
+            // step-margin 0.0548<=0.5, ops green, quiet pp 1.47x (62.5 vs
+            // 42.56 t/s), kernel 1.57x. Q27_METAL_GEMM_HALF_Q4=0 restores
+            // the float-staged q27_matmul_q4_mm.
+            impl_->gemm_half_q4 = true;
             if (const char* env = getenv("Q27_METAL_GEMM_HALF_Q4"); env && *env)
                 impl_->gemm_half_q4 = strtoul(env, nullptr, 10) != 0;
         }

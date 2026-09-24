@@ -352,8 +352,17 @@ same 8096 calls): 5319us -> 3386us avg = 1.57x. tg unchanged (decode uses
 matvec). NOTE: the code gate says "ship pending valid >=1.7x quiet run" and
 cites QUIET_BENCH_EVIDENCE.md, which is NOT in the repo (origin unclear,
 likely another machine). M1 Max quiet numbers land at 1.47x pp / 1.57x
-kernel: big win but BELOW the recorded 1.7x ship-line -> promotion is a
-user decision, default stays OFF pending that call.
+kernel: big win but BELOW the recorded 1.7x ship-line -> promotion was a
+user decision. DECISION (user, 2026-09-24): PROMOTED to default. The legacy
+">=1.7x quiet" line is NOT adopted as this repo's bar: its evidence file is
+missing and it was likely a kernel-basis number measured on other hardware.
+Precedent recorded for future ship-lines that arrive without reproducible
+evidence: re-derive the gate on THIS machine from the project's own battery
+(PPL + golden step-margins + ops + quiet alternating A/B), and document the
+substitution here rather than silently inheriting or rejecting a number.
+Caveat kept on file: 1.7x may once have encoded intent beyond speed
+(compile time, margin headroom, maintenance); if such constraints ever
+matter, revisit under this entry. Rollback: Q27_METAL_GEMM_HALF_Q4=0.
 
 ## SSM/GDN shadow (2026-09-24): decode profile diff gen96-gen8 at seq2048:
 all GDN/SSM kernels sum to 3.0ms of 113ms wall = 2.7% <= noise floor;
