@@ -338,6 +338,29 @@ lever. Corollary: prior "attention_f16 0.57us/token slope = next target"
 read is superseded — the target must still be bandwidth-side (matmul_q4
 prefill study, KV compression) not latency-side kernels.
 
+## Gate runs: dormant q4_mm_h (prefill half-staging GEMM) — 2026-09-24
+
+All numeric gates PASS for Q27_METAL_GEMM_HALF_Q4=1 (q27_matmul_q4_mm_h):
+- PPL w96/16K: 14.4023 -> 14.4088, |delta|=0.0065 <= 0.02 PASS
+  (ppl_h4_default.jsonl / ppl_h4_halfq4.jsonl).
+- golden --step-margins x {2 baselines x 2 arm runs}: one branch (p29 step51)
+  root margin 0.0548 <= 0.5 PASS (golden_m1_h4_margins_*.jsonl).
+- test-metal-ops green both arms.
+Performance, quiet alternating best-of-3 (pp-only runs, idle machine):
+pp 42.56 -> 62.5 t/s = 1.47x (stdev ~0.05); kernel-level (Q27_METAL_PROFILE,
+same 8096 calls): 5319us -> 3386us avg = 1.57x. tg unchanged (decode uses
+matvec). NOTE: the code gate says "ship pending valid >=1.7x quiet run" and
+cites QUIET_BENCH_EVIDENCE.md, which is NOT in the repo (origin unclear,
+likely another machine). M1 Max quiet numbers land at 1.47x pp / 1.57x
+kernel: big win but BELOW the recorded 1.7x ship-line -> promotion is a
+user decision, default stays OFF pending that call.
+
+## SSM/GDN shadow (2026-09-24): decode profile diff gen96-gen8 at seq2048:
+all GDN/SSM kernels sum to 3.0ms of 113ms wall = 2.7% <= noise floor;
+closed as tg lever without noop runs. Full decode shares recorded in
+STATUS history; GPU busy 76.5 vs wall 112.9 => ~36ms/token idle pool
+(possible next campaign; explains w2row absorption).
+
 ## Pending / next (in order)
 
 0a. **INTEGRATION DECISION PENDING** — see B2a/B2c above.
