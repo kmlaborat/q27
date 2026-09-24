@@ -411,6 +411,27 @@ re-reads that don't bite until ALU costs drop). Headroom framing: reaching
 the LUT arm's 33 uniq = ~3.6x GEMM time = ~2x pp (GEMM is 62-82%); past
 that needs killing the 6x re-reads (wide x-tile) to approach 58 uniq.
 
+## Phase D Step 0.1: MEASURED KV footprint (`tools/kv_footprint.cpp` -> build/kv_footprint)
+
+Engine-own math on this machine (constants N_LAYER=64, N_KV=4, HEAD_DIM=256;
+17 attn layers incl MTP block; turbo3 cache_row = N_KV*2*50):
+
+| mode | B/token (all layers, K+V) | 64K KV-only | 64K full reservation* |
+|---|--:|--:|--:|
+| fp16 (CLI default) | **68.0 KB** | 4.25 GiB | **5.15 GiB** |
+| turbo3 (8-bit, `--kv turbo3`) | **13.3 KB** | 0.83 GiB | 1.73 GiB |
+
+*reservation = serving_reservation_bytes(): KV + gqa_partial scratch + side
+fp16 cells + fixed state. Engine cache_budget = recommendedMaxWorkingSetSize
+/2 = 13.0 GiB — **64K fits with 2.5x headroom even at fp16** (weights 14.4
+GiB + 5.15 + process ~0.2 ~= 19.8 GiB < 26 GiB recommendedMaxWorkingSetSize
+< 32 GB). KV capacity is NOT the 64K constraint; compute (O(n^2) attention)
+is. Chat arithmetic corrected: user's 34 KB/token was int8-basis (x1 byte);
+fp16 is exactly 2x = 68 KB; earlier "~160KB ceiling" phrasing was wrong.
+Remaining unknown for Step 0: transient prefill activations at 64K (chunked
+prefill bounds them by CHUNK_MAX, not fully in the formula) -> measure RSS
+empirically when running 64K (Step 0 item 3).
+
 ## Phase 2B Step B: the four cost hypotheses — ALL NEGATIVE (closed, `phase2b_stepB.jsonl`)
 
 | arm | targets (independently) | ffn_up us vs prod 4833 | verdict |
