@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <cmath>
 struct MatmulArgs { uint rows; uint cols; uint x_rows; uint simdgroups; };
 static id<MTLComputePipelineState> pso(id<MTLDevice> d, id<MTLLibrary> l, NSString* n) {
     auto f = [l newFunctionWithName:n]; if (!f) return nil; NSError* e = nil;
@@ -45,10 +46,11 @@ int main(int argc, char** argv) { @autoreleasepool {
         MatmulArgs a{s.rows, s.cols, XROWS, 4};
         const double wbytes = (double)s.rows * s.cols / 2;
         const uint ygroups = (XROWS + 15) / 16;
-        for (int ai = 0; ai < 4; ai++) {
-            const char* nm[] = {"q27_matmul_q4_mm_h", "pf_stream", "pf_lut", "pf_mma_peak"};
+        for (int ai = 0; ai < 8; ai++) {
+            const char* nm[] = {"q27_matmul_q4_mm_h", "pf_stream", "pf_lut", "pf_mma_peak", "pf_b1_wide", "pf_b2_dbuf", "pf_c4_flushless", "pf_c5_prescale"};
             auto p = pso(dev, ai == 0 ? plib : blib, [NSString stringWithUTF8String:nm[ai]]);
             if (!p) { fprintf(stderr, "missing %s\n", nm[ai]); continue; }
+            const uint yg = (ai == 4) ? 1 : ygroups;   // B1 reuses six token-windows per tile
             float best = 1e30f;
             for (int rep = 0; rep < 5; rep++) {
                 CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
@@ -61,7 +63,7 @@ int main(int argc, char** argv) { @autoreleasepool {
                     [ce setBuffer:XS offset:0 atIndex:3];
                     [ce setBuffer:O offset:0 atIndex:4];
                     [ce setBytes:&a length:sizeof(a) atIndex:5];
-                    [ce dispatchThreadgroups:MTLSizeMake((s.rows + 31) / 32, ygroups, 1)
+                    [ce dispatchThreadgroups:MTLSizeMake((s.rows + 31) / 32, yg, 1)
                         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                     [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
                 }
@@ -74,5 +76,42 @@ int main(int argc, char** argv) { @autoreleasepool {
         }
     }
     fclose(out);
+    // --- bit-identity gate: B1/B2 must reproduce production mm_h exactly
+    // (same tiles, same k-order, same flush cadence — only staging differs) ---
+    {
+        const uint r = 128, c = 128, xr = 96;
+        MatmulArgs a{r, c, xr, 4};
+        auto W2=[dev newBufferWithLength:(size_t)r*(c/2) options:MTLResourceStorageModeShared];
+        auto X2=[dev newBufferWithLength:(size_t)xr*c options:MTLResourceStorageModeShared];
+        auto O1=[dev newBufferWithLength:(size_t)xr*r*2 options:MTLResourceStorageModeShared];
+        auto O2=[dev newBufferWithLength:(size_t)xr*r*2 options:MTLResourceStorageModeShared];
+        auto O3=[dev newBufferWithLength:(size_t)xr*r*2 options:MTLResourceStorageModeShared];
+        uint8_t* wp=(uint8_t*)W2.contents; for(size_t i=0;i<W2.length;i++) wp[i]=(uint8_t)(i*131+7);
+        int8_t* xp=(int8_t*)X2.contents; for(size_t i=0;i<X2.length;i++) xp[i]=(int8_t)((i%199)-99);
+        const uint names2[]={4,5}; const char* n2[]={"pf_b1_wide","pf_b2_dbuf"};
+        id<MTLBuffer> Ob[]={O1,O2,O3}; id<MTLBuffer> Wb[]={W2,W2,W2}, Xb[]={X2,X2,X2};
+        id<MTLComputePipelineState> ps[3]={pso(dev,plib,@"q27_matmul_q4_mm_h"),pso(dev,blib,@"pf_b1_wide"),pso(dev,blib,@"pf_b2_dbuf")};
+        uint yg3[]={yg3[0]}; (void)yg3;
+        uint ygs[3]={(xr+15)/16, 1, (xr+15)/16};
+        for(int i=0;i<3;i++){
+            @autoreleasepool{
+            auto cb=[q commandBuffer]; auto ce=[cb computeCommandEncoder];
+            [ce setComputePipelineState:ps[i]];
+            [ce setBuffer:Wb[i] offset:0 atIndex:0];
+            [ce setBuffer:Xb[i] offset:0 atIndex:1];
+            [ce setBuffer:XS offset:0 atIndex:2];
+            [ce setBuffer:WS offset:0 atIndex:3];
+            [ce setBuffer:Ob[i] offset:0 atIndex:4];
+            [ce setBytes:&a length:sizeof(a) atIndex:5];
+            [ce dispatchThreadgroups:MTLSizeMake(r/32,ygs[i],1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+            [ce endEncoding];[cb commit];[cb waitUntilCompleted];
+            }
+        }
+        auto*o1=(uint16_t*)O1.contents; auto*o2=(uint16_t*)O2.contents; auto*o3=(uint16_t*)O3.contents;
+        (void)0;
+        size_t n=(size_t)xr*r; long m1=0,m2=0; double md1=0,md2=0;
+        for(size_t i=0;i<n;i++){ if(memcmp(o1+i,o2+i,2)) {m1++; float f1,f2; memcpy(&f1,o1+i,2); memcpy(&f2,o2+i,2); double d=fabs((double)f2-f1)/(fabs(f1)+1e-2); if(d>md1)md1=d;} if(memcmp(o1+i,o3+i,2)){m2++; float f1,f2; memcpy(&f1,o1+i,2); memcpy(&f2,o3+i,2); double d=fabs((double)f2-f1)/(fabs(f1)+1e-2); if(d>md2)md2=d;} }
+        fprintf(stderr,"bitcheck B1 mismatches %ld (maxrel %.5f) | B2 mismatches %ld (maxrel %.5f)\n",m1,md1,m2,md2);
+    }
     return 0;
 } }

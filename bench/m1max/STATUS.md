@@ -410,8 +410,30 @@ barrier staging<->MMA, scale-flush every step, small x-tile forcing 6x
 re-reads that don't bite until ALU costs drop). Headroom framing: reaching
 the LUT arm's 33 uniq = ~3.6x GEMM time = ~2x pp (GEMM is 62-82%); past
 that needs killing the 6x re-reads (wide x-tile) to approach 58 uniq.
-Next if GO: bench-arm Step B variants (wide x-tile / double-buffered
-staging / flush-light), then engine integration as margin-gate class.
+
+## Phase 2B Step B: the four cost hypotheses — ALL NEGATIVE (closed, `phase2b_stepB.jsonl`)
+
+| arm | targets (independently) | ffn_up us vs prod 4833 | verdict |
+|---|---|--:|---|
+| pf_b1_wide | 6x weight re-read: one staged tile serves 6 token windows (bit-identical, harness-verified) | 7078 (-46%) | NEG — reuse is L2-served anyway; wider racc regs cost occupancy |
+| pf_b2_dbuf | load->compute serialization: double-buffered staging (bit-identical) | 5728 (-19%) | NEG — smem doubling cut threadgroups/SM; latency was not exposed |
+| pf_c4_flushless | flush cadence /4 (math wrong by design, attribution only) | 4584 (-5%) | flush scale-fold ~= 300us total |
+| pf_c5_prescale | flush eliminated entirely (scales fp16-folded at staging; tensor acc across full K; margin-class math) | 4387 (-9%) | scale/flush machinery ~= 450us |
+
+What survives the four falsifications: the per-step COUPLING of
+threadgroup-staging writes with tensor-core smem operand reads. Remove
+either side and the same shape runs at pf_lut 1335us or mma_peak 414us;
+keep both coupled in ANY arrangement measured here and it sits 4.4-5.7ms.
+Likely the Apple P-tile shared LSU/tensor fabric (32KB smem tiles per step
+per threadgroup, banked operand reads) — a hardware trait, not scheduling.
+Remaining fix families (both beyond current budget, PARKED with this
+attribution): smem-free dot-style prefill GEMM (x kept L1/L2-hot, weights
+streamed once; needs token-blocking with either 12x weight re-stream or
+96-accumulator register games), or P-tile-shaped mma primitives.
+Lesson for Apple-silicon GEMM: components can each measure ~free while
+their coupling is the wall — probe pairwise, not unarily. pp +47% (mm_h)
+stands as the shipped prefill win; prefill micro-optimization is NOT
+recommended as the next session's first move.
 
 ## Phase 2A: speculation config sweep — CLOSED with no config change (2026-09-24)
 
