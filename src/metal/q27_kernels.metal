@@ -1339,6 +1339,98 @@ kernel void q27_matvec_q4_quantized(device const uchar *weights [[buffer(0)]],
     }
 }
 
+// Q27_METAL_Q4_ARM=h (M1 Max, bench m1max/roofline_m1_b2a/b2c): fp16
+// magic-number nibble dot. Extraction: 0x6400|n is the half 1024+n exactly
+// (n in [0,15], normal range); minus the 1032 bias vector gives (n-8). Each
+// product with half(x) (|x| <= 127 exact in half) is <= 15*127/1024 < 2 and
+// needs <= 11 mantissa bits -> exact half value; the fp32 accumulation of
+// dot/1024 over 32 terms has |sum| < 32 with full fp32 headroom for the
+// exact-integer reconstruction, so the resulting float(dot) equals the
+// int8 path's float(exact int) BIT-FOR-BIT, and the scale chain is the same
+// text as q27_matvec_q4_quantized above. Verified bitwise against the
+// production kernel on random nibbles/scales/x for every q4s shape
+// (tools/roofline_m1.mm BITCHECK, mismatches=0), +38-40% on M1 Max; the
+// short 2-step extraction cuts the load->unpack dependency latency that the
+// 8-step shift chain serialized (constdot diagnostic, STATUS.md). Two
+// chunks per iteration where shape allows; the odd-chunk tail runs the same
+// single-chunk math.
+inline half2 q27_half2_nib2_p(uint shifted_masked) {   // {1024+na, 1024+nb} low halfs
+    return as_type<half2>(shifted_masked | 0x64006400u) - half2(1032.0h);
+}
+
+kernel void q27_matvec_q4_quantized_h(device const uchar *weights [[buffer(0)]],
+                                       device const half *weight_scales [[buffer(1)]],
+                                       device const char *x [[buffer(2)]],
+                                       device const float *x_scales [[buffer(3)]],
+                                       device float *out [[buffer(4)]],
+                                       constant MatvecArgs &args [[buffer(5)]],
+                                       uint group [[threadgroup_position_in_grid]],
+                                       ushort lane [[thread_index_in_simdgroup]],
+                                       ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = (group * 8 + (uint)simdgroup) * 4;
+    if (row0 >= args.rows) return;
+    const uint rlast = args.rows - 1;
+    device const int4 *x16 = (device const int4 *)x;
+    const uint sgroups = args.cols / 64;
+    device const uint4 *w[4];
+    ulong sbase[4];
+    for (uint r = 0; r < 4; r++) {
+        const uint row = min(row0 + r, rlast);   // clamped rows compute, don't store
+        w[r] = (device const uint4 *)(weights + (ulong)row * (args.cols / 2));
+        sbase[r] = (ulong)row * sgroups;
+    }
+    float4 acc = 0.0f;
+    const uint chunks = args.cols / 1024;
+    for (uint chunk = 0; chunk < chunks; chunk++) {
+        const uint idx = chunk * 32 + lane;
+        const int4 xp0 = x16[idx * 2];
+        const int4 xp1 = x16[idx * 2 + 1];
+        const uint c = chunk * 1024 + lane * 32;
+        const float xs = x_scales[c / 32];
+        float xcol[32];
+        xcol[0]  = float(as_type<char4>(xp0.x).x); xcol[1]  = float(as_type<char4>(xp0.x).y);
+        xcol[2]  = float(as_type<char4>(xp0.x).z); xcol[3]  = float(as_type<char4>(xp0.x).w);
+        xcol[4]  = float(as_type<char4>(xp0.y).x); xcol[5]  = float(as_type<char4>(xp0.y).y);
+        xcol[6]  = float(as_type<char4>(xp0.y).z); xcol[7]  = float(as_type<char4>(xp0.y).w);
+        xcol[8]  = float(as_type<char4>(xp0.z).x); xcol[9]  = float(as_type<char4>(xp0.z).y);
+        xcol[10] = float(as_type<char4>(xp0.z).z); xcol[11] = float(as_type<char4>(xp0.z).w);
+        xcol[12] = float(as_type<char4>(xp0.w).x); xcol[13] = float(as_type<char4>(xp0.w).y);
+        xcol[14] = float(as_type<char4>(xp0.w).z); xcol[15] = float(as_type<char4>(xp0.w).w);
+        xcol[16] = float(as_type<char4>(xp1.x).x); xcol[17] = float(as_type<char4>(xp1.x).y);
+        xcol[18] = float(as_type<char4>(xp1.x).z); xcol[19] = float(as_type<char4>(xp1.x).w);
+        xcol[20] = float(as_type<char4>(xp1.y).x); xcol[21] = float(as_type<char4>(xp1.y).y);
+        xcol[22] = float(as_type<char4>(xp1.y).z); xcol[23] = float(as_type<char4>(xp1.y).w);
+        xcol[24] = float(as_type<char4>(xp1.z).x); xcol[25] = float(as_type<char4>(xp1.z).y);
+        xcol[26] = float(as_type<char4>(xp1.z).z); xcol[27] = float(as_type<char4>(xp1.z).w);
+        xcol[28] = float(as_type<char4>(xp1.w).x); xcol[29] = float(as_type<char4>(xp1.w).y);
+        xcol[30] = float(as_type<char4>(xp1.w).z); xcol[31] = float(as_type<char4>(xp1.w).w);
+        for (uint r = 0; r < 4; r++) {
+            const uint wds[4] = {w[r][idx].x, w[r][idx].y, w[r][idx].z, w[r][idx].w};
+            float dot = 0.0f;
+            #pragma unroll
+            for (uint k = 0; k < 4; k++) {
+                const uint wv = wds[k];
+                // Col bit order: col0=bits0-3 ... col7=28-31; shift 4s with
+                // mask 0x000F000F yields the half2 pair {col s, col s+4}.
+                const float2 nA0 = float2(q27_half2_nib2_p((wv     ) & 0x000F000Fu));
+                const float2 nA1 = float2(q27_half2_nib2_p((wv >> 4) & 0x000F000Fu));
+                const float2 nA2 = float2(q27_half2_nib2_p((wv >> 8) & 0x000F000Fu));
+                const float2 nA3 = float2(q27_half2_nib2_p((wv >>12) & 0x000F000Fu));
+                const uint base = k * 8;
+                dot += nA0.x * xcol[base + 0] + nA0.y * xcol[base + 4]
+                     + nA1.x * xcol[base + 1] + nA1.y * xcol[base + 5]
+                     + nA2.x * xcol[base + 2] + nA2.y * xcol[base + 6]
+                     + nA3.x * xcol[base + 3] + nA3.y * xcol[base + 7];
+            }
+            acc[r] += dot * float(weight_scales[sbase[r] + c / 64]) * xs;
+        }
+    }
+    for (uint r = 0; r < 4; r++) {
+        const float tot = simd_sum(acc[r]);
+        if (lane == 0 && row0 + r < args.rows) out[row0 + r] = tot;
+    }
+}
+
 // Round residue (docs/plans/2026-07-17-q4-rewrite-round.md): the r4 arm above
 // was PROMOTED into q27_matvec_q4_quantized (bench R = 0.957); r2 below stays
 // as the retained comparison arm (bench R = 0.826). Bench-only, dispatched by

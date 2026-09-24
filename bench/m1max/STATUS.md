@@ -281,6 +281,21 @@ extraction or tensor-core routing) with uncertain payoff. Decision point for
 the user: integrate halfdot4 as-is at +38% (bit-identical gate), or keep
 bench-mining toward ~338.
 
+## Step B2 INTEGRATED — fp16-dot matvec promoted to default (2026-09-24)
+
+Engine: `q27_matvec_q4_quantized_h` in q27_kernels.metal; backend selects it
+by default (`Q27_METAL_Q4_ARM=r0` restores the previous int8-dot kernel).
+Gate results (fresh binaries — note the earlier "verification" ran on a stale
+binary without the kernel and was redone; lesson: the metal source is
+embedded at compile time, rebuild golden/bench/ops after kernel edits):
+- Golden digests bit-identical to pre-change baselines: 64 prompts x 2 reps,
+  0 mismatches (both baseline pairs + arm-vs-arm invariance).
+- test-metal-ops green both arms.
+- tg @ seq512: 11.67 -> 15.04-15.06 (+29.0%); seq4096: 10.48 -> 13.59 (+30%).
+- PPL: unchanged by construction (bit-identical logits).
+Bench-side ceiling analysis (constdot 338) unchanged; deeper reformulation
+(mantissa-direct / simdgroup_matrix) left as the low-priority B tail.
+
 ## Pending / next (in order)
 
 0a. **INTEGRATION DECISION PENDING** — see B2a/B2c above.

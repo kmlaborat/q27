@@ -702,6 +702,15 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->quantize = make_pipeline(impl_->device, impl_->library, @"q27_quantize_x");
         impl_->q8_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q8_quantized");
         impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized");
+        // M1 Max decode path, promoted to default (m1max): fp16 magic-number
+        // nibble dot, +29% tg on device (bench/m1max/tg_arm_*), golden
+        // digests bit-identical to the previous kernel across 64 prompts x
+        // 2 reps, ops suite green. Q27_METAL_Q4_ARM=r0 restores the
+        // previous int8-dot kernel.
+        if (const char* arm = getenv("Q27_METAL_Q4_ARM"); arm && strcmp(arm, "r0") == 0)
+            ;  // keep q27_matvec_q4_quantized
+        else
+            impl_->q4_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_q4_quantized_h");
         impl_->t2_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized");
         impl_->b1_quantized = make_pipeline(impl_->device, impl_->library, @"q27_matvec_b1_quantized");
         impl_->t2_quantized_x2 = make_pipeline(impl_->device, impl_->library, @"q27_matvec_t2_quantized_x2");
