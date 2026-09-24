@@ -411,6 +411,38 @@ re-reads that don't bite until ALU costs drop). Headroom framing: reaching
 the LUT arm's 33 uniq = ~3.6x GEMM time = ~2x pp (GEMM is 62-82%); past
 that needs killing the 6x re-reads (wide x-tile) to approach 58 uniq.
 
+## Phase D Step 0 DONE: 64K on 32GB — fits, no swap, flat footprint, compute is the wall
+
+Step 0.2 (overrun behavior): engine rejects cleanly BEFORE allocation —
+"requested KV cache ... exceeds the configured cache budget; use --kv
+turbo3, raise --budget-mb, or reduce --ctx" at ctx 229440+/262144. No crash,
+no swap death: budget check is the governor (cache_budget =
+recommendedMaxWorkingSetSize/2 = 13.0 GiB).
+
+Step 0.3 (bench_metal --ctx 65536 fp16 --seq 16320,32760,65400 --gen 16,
+`bench/m1max/d_step0_rss.jsonl`; synthetic-repeated paragraph — fine for
+memory/scaling, not for absolute real-text pp):
+
+| ctx | pp t/s | tg t/s | peak RSS (process) | swaps |
+|--:|--:|--:|--:|--:|
+| 16320 | 33.6 | 9.58 | 4.8 GiB (flat) | 0 |
+| 32760 | 22.1 | 6.85 | 4.8 GiB (flat) | 0 |
+| 65400 | **13.1** | **4.52** | 5.17 GiB | 0 |
+
+- 64K works. Peak footprint 5.17 GiB == reservation 5.15 GiB + process: the
+  reservation math is honest, no hidden transient blowup (chunked prefill
+  stays inside the formula's envelope).
+- vmmap stayed 4.8G across 16K->32K->64K re-ingests in ONE process
+  (reset->ingest->decode x3): **compaction-style re-ingest does not leak** —
+  KV release tracks. (Prefix-cache/server path untested; bench-level reset
+  loop is the proxy.)
+- pp curve collapses with context: 62.5 (short) -> 47.3 (7.2K) -> 33.6
+  (16K) -> 22.1 (32K) -> 13.1 (64K): worse than the naive O(n^2) attention
+  extrapolation; a 64K cold ingest = ~83 minutes. tg halves too
+  (14.7 -> 4.52). Capacity NOT the constraint (2.5x headroom at fp16,
+  6x+ at turbo3); **prefill attention compute is the wall**.
+- bench_metal synthetic prompt cap raised (200 -> 4000 repeats) to reach 64K.
+
 ## Phase D Step 0.1: MEASURED KV footprint (`tools/kv_footprint.cpp` -> build/kv_footprint)
 
 Engine-own math on this machine (constants N_LAYER=64, N_KV=4, HEAD_DIM=256;

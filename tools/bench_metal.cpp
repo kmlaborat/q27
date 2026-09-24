@@ -126,7 +126,7 @@ int main(int argc, char** argv) try {
         base = tokenizer.encode(txt);
         fprintf(stderr, "prompt-file: %zu tokens from %s\n", base.size(), prompt_file.c_str());
     } else
-    for (int n = 0; n < 200 && base.size() < 65536; n++) {
+    for (int n = 0; n < 4000 && base.size() < 262144; n++) {   // m1max Phase D: reach 64K+ prompts (was 200x~36 ~= 7.2K)
         auto enc = tokenizer.encode(para + std::to_string(n) + " ");
         base.insert(base.end(), enc.begin(), enc.end());
     }
