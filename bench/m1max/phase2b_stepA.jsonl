@@ -1,0 +1,12 @@
+{"kernel":"q27_matmul_q4_mm_h","shape":"ffn_up","us":4903,"uniqgbs":9.09,"devgbs":54.54}
+{"kernel":"pf_stream","shape":"ffn_up","us":768,"uniqgbs":58.03,"devgbs":348.18}
+{"kernel":"pf_lut","shape":"ffn_up","us":1337,"uniqgbs":33.33,"devgbs":200.00}
+{"kernel":"pf_mma_peak","shape":"ffn_up","us":412,"uniqgbs":108.17,"devgbs":649.02}
+{"kernel":"q27_matmul_q4_mm_h","shape":"attn_o","us":1561,"uniqgbs":8.40,"devgbs":50.38}
+{"kernel":"pf_stream","shape":"attn_o","us":385,"uniqgbs":34.05,"devgbs":204.31}
+{"kernel":"pf_lut","shape":"attn_o","us":550,"uniqgbs":23.83,"devgbs":142.98}
+{"kernel":"pf_mma_peak","shape":"attn_o","us":280,"uniqgbs":46.83,"devgbs":280.97}
+{"kernel":"q27_matmul_q4_mm_h","shape":"ffn_down","us":4822,"uniqgbs":9.24,"devgbs":55.45}
+{"kernel":"pf_stream","shape":"ffn_down","us":766,"uniqgbs":58.18,"devgbs":349.05}
+{"kernel":"pf_lut","shape":"ffn_down","us":1346,"uniqgbs":33.11,"devgbs":198.65}
+{"kernel":"pf_mma_peak","shape":"ffn_down","us":425,"uniqgbs":104.86,"devgbs":629.17}

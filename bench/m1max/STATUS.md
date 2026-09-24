@@ -390,6 +390,29 @@ after all closures: the matvec busy stream itself (53.5ms, 72%): the old
 B-tail (264->338 GB/s ceiling, ~+10% tg upper bound, uncertain) is the
 only sizeable unexploited item on record.
 
+## Phase 2B Step A: prefill GEMM roofline decomposition (2026-09-24, `phase2b_stepA.jsonl`)
+
+Prefill shares (profiled, +2.3% profiler inflation confirmed vs clean pp;
+phase2b_ppcurve.jsonl clean curve 68.6/62.5/55.1/47.3 t/s @512/2048/4096/7168):
+matmul_q4_mm_h 62-82% (per-call flat ~3.4ms), causal_gqa_t2 grows
+8.5%->32.5% from seq2048->7168 (O(n^2), D-phase early signal), delta_chunk ~2%.
+
+Step A arms (tools/pf_roof.mm + tools/bench_pf.metal, real ffn shapes,
+production grid rows/32 x ceil(96/16), 128 threads; GB/s = unique weight
+bytes/us; devGB/s = x6 device traffic from the y-group re-read pattern):
+  stream   58 uniq / 348 dev  -> memory delivery IS at the DRAM roof (~98%)
+  +LUT     33 uniq            -> dequant staging alone costs +74% vs stream
+  prod mm_h 9.1 uniq (55 dev) -> 3.7x SLOWER than even the LUT arm
+  mma_peak ~12x faster than prod -> tensor cores are NOT the constraint
+Waterfall: 768us stream -> 1337 +LUT -> 4903 prod. The bulk (3.7x) is NOT
+memory and NOT MMA throughput: it is the serialize pattern (per-64-col
+barrier staging<->MMA, scale-flush every step, small x-tile forcing 6x
+re-reads that don't bite until ALU costs drop). Headroom framing: reaching
+the LUT arm's 33 uniq = ~3.6x GEMM time = ~2x pp (GEMM is 62-82%); past
+that needs killing the 6x re-reads (wide x-tile) to approach 58 uniq.
+Next if GO: bench-arm Step B variants (wide x-tile / double-buffered
+staging / flush-light), then engine integration as margin-gate class.
+
 ## Phase 2A: speculation config sweep — CLOSED with no config change (2026-09-24)
 
 Synthetic bench corpus (same paragraph x200 + counters) inflates suffix-draft
