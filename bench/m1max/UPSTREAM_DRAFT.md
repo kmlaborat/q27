@@ -2,7 +2,7 @@
 
 Status: DRAFT — written from the m1max tuning campaign (bench/m1max/STATUS.md,
 commits 7668547..HEAD). Nothing here is filed yet; each item is self-contained
-and can be posted independently. Numbers are from a single M1 Max 64GB
+and can be posted independently. Numbers are from a single M1 Max 32GB
 (macOS 26.3) running this repo at the cited commits. Verify on your own
 hardware before quoting.
 
