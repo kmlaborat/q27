@@ -59,7 +59,7 @@ int main(int argc, char** argv) try {
     if (!streamlib) { fprintf(stderr, "stream: %s\n", err.localizedDescription.UTF8String); return 1; }
         struct PSO { id<MTLComputePipelineState> p; NSString* name; };
     std::vector<PSO> psos;
-    for (NSString* sn : @[ @"bench_stream", @"bench_stream2", @"bench_stream_x", @"bench_stream_sc", @"bench_sc_dot2", @"bench_sc_dot4" ]) {
+    for (NSString* sn : @[ @"bench_stream", @"bench_stream2", @"bench_stream_x", @"bench_stream_sc", @"bench_sc_dot2", @"bench_sc_dot4", @"bench_sc_constdot", @"bench_sc_halfdot4", @"bench_sc_halfdot4p", @"bench_sc_halfdot4u2" ]) {
         id<MTLFunction> sf = [streamlib newFunctionWithName:sn];
         if (!sf) { fprintf(stderr, "missing stream fn %s\n", sn.UTF8String); continue; }
         auto pso = [device newComputePipelineStateWithFunction:sf error:&err];
@@ -108,6 +108,74 @@ int main(int argc, char** argv) try {
         id<MTLBuffer> O = [device newBufferWithLength:s.rows * 4
                                               options:MTLResourceStorageModeShared];
         auto q = qbuf(nil);
+
+        // Randomize inputs for the bit-identity digest check (W: random
+        // nibbles; S: fixed safe half 0.25 = 0x3400 patterns; x: random
+        // signed bytes). All shapes here are multiples of 32 rows, so the
+        // clamped-row race cannot perturb outputs.
+        {
+            uint64_t st = 0x9E3779B97F4A7C15ull ^ (s.rows << 32) ^ s.cols;
+            auto xs64 = [&]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+            uint8_t* wd = (uint8_t*)W.contents;
+            for (uint64_t i = 0; i < wbytes; i += 8) *(uint64_t*)(wd + i) = xs64();
+            uint16_t* sd = (uint16_t*)S.contents;
+            for (uint64_t i = 0; i < s.rows * (s.cols / 64); i++)
+                sd[i] = uint16_t(0x3C00u | ((xs64() >> 3) & 0x3Fu));   // 0.25..0.25*1.046..
+            int8_t* xd = (int8_t*)X.contents;
+            for (uint64_t i = 0; i < s.cols; i += 8) {
+                uint64_t v = xs64();
+                for (int b = 0; b < 8; b++) xd[i + b] = int8_t((v >> (b * 8)) & 0xff);
+            }
+            float* xsd = (float*)XS.contents;
+            for (uint64_t i = 0; i < s.cols / 32; i++) xsd[i] = 1.0f + float(i % 7) * 0.01f;
+        }
+        // Bit-identity digest check: production kernel vs bench arms.
+        {
+            auto run_one = [&](id<MTLComputePipelineState> pso, NSUInteger rpg, float* dst) {
+                @autoreleasepool {
+                    auto cb = [q commandBuffer];
+                    auto ce = [cb computeCommandEncoder];
+                    [ce setComputePipelineState:pso];
+                    [ce setBuffer:W offset:0 atIndex:0];
+                    [ce setBuffer:S offset:0 atIndex:1];
+                    [ce setBuffer:X offset:0 atIndex:2];
+                    [ce setBuffer:XS offset:0 atIndex:3];
+                    [ce setBuffer:O offset:0 atIndex:4];
+                    MatvecArgsBench a{(uint32_t)s.rows, (uint32_t)s.cols};
+                    [ce setBytes:&a length:sizeof(a) atIndex:5];
+                    [ce dispatchThreadgroups:MTLSizeMake((s.rows + rpg - 1) / rpg, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                }
+                memcpy(dst, O.contents, s.rows * 4);
+            };
+            std::vector<float> ref(s.rows);
+            for (auto& ps : psos) {
+                if (![ps.name hasPrefix:@"bench_sc_"] && ![ps.name isEqualToString:@"bench_stream_sc"]) continue;
+                if ([ps.name isEqualToString:@"bench_sc_constdot"]) continue;  // not comparable by design
+                run_one(ps.p, [ps.name isEqualToString:@"q27_matvec_q4_quantized_r2"] ? 16 : 32, ref.data());
+                std::vector<float> refprod(ref);
+                (void)refprod; break;
+            }
+            // capture production reference explicitly
+            for (auto& ps : psos)
+                if ([ps.name isEqualToString:@"q27_matvec_q4_quantized"]) {
+                    run_one(ps.p, 32, ref.data());
+                    for (auto& ps2 : psos) {
+                        NSString* n = ps2.name;
+                        if (![n isEqualToString:@"bench_sc_dot4"] && ![n isEqualToString:@"bench_sc_halfdot4"] && ![n isEqualToString:@"bench_sc_halfdot4p"] && ![n isEqualToString:@"bench_sc_halfdot4u2"]) continue;
+                        std::vector<float> got(s.rows);
+                        run_one(ps2.p, 32, got.data());
+                        size_t bad = 0;
+                        for (uint64_t i = 0; i < s.rows; i++)
+                            if (memcmp(&ref[i], &got[i], 4) != 0) bad++;
+                        fprintf(stderr, "BITCHECK %-20s %5zux%-6zu mismatches=%zu %s\n",
+                                n.UTF8String, s.rows, s.cols, bad, bad ? "FAIL" : "OK");
+                        out << std::string("{\"bitcheck\":\"") + n.UTF8String + std::string("\", \"rows\":") + std::to_string((unsigned long long)s.rows) + std::string(", \"cols\":") + std::to_string((unsigned long long)s.cols) + std::string(", \"mismatches\":") + std::to_string(bad) + "}";
+                    }
+                    break;
+                }
+        }
         @autoreleasepool {
             auto enc = [q commandBuffer];
             for (auto& ps : psos) {

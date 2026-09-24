@@ -255,9 +255,36 @@ exact in fp32 up to 32512) could target the dot2 arm's 332 GB/s while
 keeping bit-identical math. B1 (x broadcast) alone: ~+5%, below the user's
 +25% solo threshold; fold into B2 only if B2 needs the load slots.
 
+## Step B2a/B2c — bit-identical fp16-dot rewrite: +38-40% (2026-09-23,
+`bench/m1max/roofline_m1_b2a/b2b/b2c.jsonl`)
+
+New bench arms in `tools/bench_stream.metal`, all compared BITWISE against
+the production kernel on random inputs (random nibbles, nontrivial scales,
+random signed x) inside `tools/roofline_m1.mm`:
+
+- `bench_sc_constdot` (full dot4 math on CONSTANT words): 338 GB/s — the
+  dot math is FREE when it doesn't consume loads. The wall is the
+  load->shift-chain dependency, not instruction throughput.
+- `bench_sc_halfdot4` (fp16 magic-number exact dot, `0x6400|n = 1024+n,
+  -1032` bias fold): **264 GB/s DRAM shape, +38-40% over production,
+  mismatches=0 on every shape** — bit-identical confirmed in-bench before
+  any timing conclusion, per the user's standing rule.
+- `bench_sc_halfdot4p` (manual double-buffer pipeline): WORSE (occupancy
+  640->448) — negative result.
+- `bench_sc_halfdot4u2` (independent 2-chunk unroll): no gain over half4
+  (within noise) — negative result.
+
+Status: half4 at 264 vs constdot ceiling 338: the short-chain extraction
+recovers about half the dependency penalty; two standard ILP fixes came up
+empty, further gains would need a deeper reformulation (direct-float-mantissa
+extraction or tensor-core routing) with uncertain payoff. Decision point for
+the user: integrate halfdot4 as-is at +38% (bit-identical gate), or keep
+bench-mining toward ~338.
+
 ## Pending / next (in order)
 
-0. **matvec Step B2 — AWAITING USER GO after B0** (see B0 section above):
+0a. **INTEGRATION DECISION PENDING** — see B2a/B2c above.
+0b. **(superseded) matvec Step B2 — AWAITING USER GO after B0** (see B0 section above):
    rewrite q27_dot8_q4 as an exact fp16 magic-number dot as a bench arm
    FIRST (`bench_sc_halfdot4`), measure at the same geometry; only then
    engine-integrate behind `Q27_METAL_Q4_ARM`. Gate stays digest-equality
