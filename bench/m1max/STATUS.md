@@ -296,6 +296,32 @@ embedded at compile time, rebuild golden/bench/ops after kernel edits):
 Bench-side ceiling analysis (constdot 338) unchanged; deeper reformulation
 (mantissa-direct / simdgroup_matrix) left as the low-priority B tail.
 
+## Attention decode diagnosis (2026-09-24, `bench/m1max/attn_roof_*.jsonl`)
+
+Harness `tools/attn_roof.mm` + `tools/bench_attn.metal` (bench-only; engine
+kernels timed as-compiled). IMPORTANT: decode's real path is turbo3
+(8-bit KV, 400B/token/layer), NOT attention_f16 — f16 only when KV=fp16
+mode is forced. Real model: 24 q-heads / 4 kv / head_dim 256, 17 attn
+layers of 65. tg unit is tokens/s (higher=better; reconciles with matvec
+roofline: 1000/13.5 = 74ms/step ~= 14.2GB/264GB/s matvec + ~12ms attention
++ GDN/misc).
+
+Findings (per dispatch, best-of-5, x8-amortized):
+- exp/SFU cost: ZERO (noexp == prod). Online-softmax max/l chain alone:
+  ZERO (nosm == prod). Dispatch floor (empty, same grids): ~30us.
+- The wall is staging+dot structure: same-bytes stream arm is ~114us vs
+  prod 660-730us (b256). nostage (device-direct, 6x redundant bytes) is
+  WORSE -> keep smem staging, fix the per-row ILP instead.
+- attn_w2row (two KV rows in flight per iteration; pair-rescaled online
+  softmax, accumulation order changes -> margin-gate class) = -30..-33%
+  at b256 across all seq. Candidate for a bench->engine integration.
+- Grid levers on the HARNESS mislead: b128 looked -42% there but on
+  device tg it is WORSE (-6.3% at 2048); b1024 loses badly as grid says.
+  Device A/B (tg, seq2048, gen64): plain-only 12.48 | b256 13.81 | b1024
+  9.53 (t/s) -> shipped b256 default confirmed best; grid_m1 stands.
+Attention share at seq4096 ~ 12ms/74ms step; w2row upper bound ~ +5% tg
+at long seq. Priority: medium (matvec done; this is the next real slice).
+
 ## Pending / next (in order)
 
 0a. **INTEGRATION DECISION PENDING** — see B2a/B2c above.
