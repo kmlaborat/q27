@@ -326,6 +326,8 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> nll_rows_p;
     id<MTLComputePipelineState> attention_f16_gqa_p;
     id<MTLComputePipelineState> attention_turbo3_gqa_p;
+    // Two-rows-per-tile variant (Q27_METAL_ATT=w2); nil = route disabled.
+    id<MTLComputePipelineState> attention_turbo3_gqa_w2_p;
     id<MTLComputePipelineState> attention_gqa_merge_p;
     id<MTLComputePipelineState> attention_f16_causal_gqa_p;
     id<MTLComputePipelineState> attention_turbo3_causal_gqa_p;
@@ -420,7 +422,9 @@ struct MetalBackend::Impl {
             bool own;
             auto enc = encoder_for_operation(own, turbo3 ? "q27_attention_turbo3_gqa"
                                                          : "q27_attention_f16_gqa");
-            [enc setComputePipelineState:turbo3 ? attention_turbo3_gqa_p : attention_f16_gqa_p];
+            id<MTLComputePipelineState> gqa_p = turbo3 ? attention_turbo3_gqa_p : attention_f16_gqa_p;
+            if (turbo3 && attention_turbo3_gqa_w2_p) gqa_p = attention_turbo3_gqa_w2_p;
+            [enc setComputePipelineState:gqa_p];
             [enc setBuffer:qb.handle() offset:0 atIndex:0];
             [enc setBuffer:kc.handle() offset:0 atIndex:1];
             [enc setBuffer:vc.handle() offset:0 atIndex:2];
@@ -791,6 +795,11 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->nll_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_nll_rows");
         impl_->attention_f16_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_gqa");
         impl_->attention_turbo3_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa");
+        // Opt-in 2-row/tile decode attention (m1max: -33..-35% per dispatch).
+        // fp reassociation vs the default route, so golden-margin gated.
+        if (const char* att = getenv("Q27_METAL_ATT"); att && strcmp(att, "w2") == 0)
+            impl_->attention_turbo3_gqa_w2_p =
+                make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa_w2");
         impl_->attention_gqa_merge_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_gqa_merge");
         impl_->attention_f16_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_causal_gqa");
         impl_->attention_turbo3_causal_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_causal_gqa");

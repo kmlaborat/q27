@@ -82,6 +82,7 @@ int main(int argc, char** argv) {
         collect(bench_lib, "attn_nostage");
         collect(bench_lib, "attn_nosm");
         collect(bench_lib, "attn_w2row");
+        collect(bench_lib, "attn_t3_w2row");
 
         FILE* out = fopen(out_path.c_str(), "w");
         fprintf(stderr, "%-22s %6s %6s %9s %9s %9s\n", "kernel", "seq", "block", "us", "us/token", "KV GB/s");
@@ -171,6 +172,53 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // Numeric check: production turbo3_gqa partials vs attn_t3_w2row
+        // partials (same random KV/q), max abs rel-diff on m/l/acc fields.
+        {
+            auto prod = make_pso(dev, prod_lib, @"q27_attention_turbo3_gqa");
+            auto arm  = make_pso(dev, bench_lib, @"attn_t3_w2row");
+            std::vector<float> p1((size_t)QH * 64 * 258);
+            for (uint32_t si = 0; si < sizeof(seqs)/sizeof(*seqs); si++) {
+                const uint32_t seq = seqs[si], block = 256;
+                uint32_t nb = 1 + (seq - 1) / block;
+                AttentionGqaArgs ga{QS, seq, QH, KVH, HD, block, nb, 0.0625f};
+                auto run = [&](id<MTLComputePipelineState> p) {
+                    memset(PART.contents, 0, (size_t)QH * 64 * 258 * 4);
+                    @autoreleasepool {
+                        auto cb = [q commandBuffer];
+                        auto ce = [cb computeCommandEncoder];
+                        [ce setComputePipelineState:p];
+                        [ce setBuffer:Q offset:0 atIndex:0];
+                        [ce setBuffer:KC offset:0 atIndex:1];
+                        [ce setBuffer:VC offset:0 atIndex:2];
+                        [ce setBuffer:PART offset:0 atIndex:3];
+                        [ce setBytes:&ga length:sizeof(ga) atIndex:4];
+                        [ce dispatchThreadgroups:MTLSizeMake(KVH, nb, 1)
+                            threadsPerThreadgroup:MTLSizeMake(GQA * 32, 1, 1)];
+                        [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                    }
+                };
+                run(prod);
+                memcpy(p1.data(), PART.contents, (size_t)QH * nb * 258 * 4);
+                run(arm);
+                float* a = p1.data(); float* b = (float*)PART.contents;
+                double worst = 0.0; size_t at = 0;
+                for (uint32_t qh = 0; qh < QH; qh++)
+                    for (uint32_t k = 0; k < nb; k++) {
+                        float* pa = a + ((size_t)qh * nb + k) * 258;   // p1 used tight layout? prod wrote with same nb layout
+                        float* pb = b + ((size_t)qh * nb + k) * 258;
+                        if (pa[1] == 0 && pb[1] == 0) continue;
+                        for (uint32_t d = 0; d < 258; d++) {
+                            double scale = fabs(pa[d]) + 1e-6;
+                            double rel = fabs(pa[d] - pb[d]) / scale;
+                            if (rel > worst) { worst = rel; at = d; }
+                        }
+                    }
+                fprintf(out, "{\"numcheck\":\"attn_t3_w2row\",\"seq\":%u,\"max_rel\":%.3e}\n", seq, worst);
+                fprintf(stderr, "numcheck seq %u max_rel=%.2e (field %zu)\n", seq, worst, at);
+            }
+        }
+
         fclose(out);
     }
     return 0;

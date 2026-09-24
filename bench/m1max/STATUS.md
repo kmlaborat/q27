@@ -322,6 +322,22 @@ Findings (per dispatch, best-of-5, x8-amortized):
 Attention share at seq4096 ~ 12ms/74ms step; w2row upper bound ~ +5% tg
 at long seq. Priority: medium (matvec done; this is the next real slice).
 
+## w2row engine integration: NEGATIVE at tg level (2026-09-24)
+
+`q27_attention_turbo3_gqa_w2` (Q27_METAL_ATT=w2, default off): 2-row/tile
+pair-rescale online softmax. Kernel-level -33..-35% vs turbo3_gqa at every
+seq (bench numcheck: partials agree to ~1e-6). Gates: ops green both arms;
+golden 64 prompts x {base,w2} x 2 runs with --step-margins: 0 branches,
+max-root-margin 0.0000 -> PASS. BUT device tg A/B (gen64, 2 runs best-of):
+seq512 +0.3%, 2048 +0.3%, 4096 -0.0%, 7168 +0.2% — NO tg gain anywhere.
+Interpretation: decode attention dispatches are absorbed alongside the
+DRAM-bound matvec streams (GPU work saturates on matvec; attention overlaps
+or queues invisibly), so attention kernel wins don't surface in tg while
+matvec rules. Kernel stays opt-in; attention micro-opt is CLOSED as a tg
+lever. Corollary: prior "attention_f16 0.57us/token slope = next target"
+read is superseded — the target must still be bandwidth-side (matmul_q4
+prefill study, KV compression) not latency-side kernels.
+
 ## Pending / next (in order)
 
 0a. **INTEGRATION DECISION PENDING** — see B2a/B2c above.
