@@ -390,33 +390,31 @@ after all closures: the matvec busy stream itself (53.5ms, 72%): the old
 B-tail (264->338 GB/s ceiling, ~+10% tg upper bound, uncertain) is the
 only sizeable unexploited item on record.
 
-## Pending / next (in order)
+## Session close state (2026-09-24) — everything above resolved or closed
 
-0a. **INTEGRATION DECISION PENDING** — see B2a/B2c above.
-0b. **(superseded) matvec Step B2 — AWAITING USER GO after B0** (see B0 section above):
-   rewrite q27_dot8_q4 as an exact fp16 magic-number dot as a bench arm
-   FIRST (`bench_sc_halfdot4`), measure at the same geometry; only then
-   engine-integrate behind `Q27_METAL_Q4_ARM`. Gate stays digest-equality
-   (the rewrite is mathematically bit-identical by construction).
-1. **(superseded) matvec Step B — AWAITING USER GO after Step A** (Step A done above).
-   Planned split per user's 2026-09-23 note: B0 = bench-only incremental
-   arms (stream+x, stream+scales, …) to decompose where 356->185 GB/s is
-   lost; B1 = x broadcast via threadgroup memory (bit-identical expected,
-   gate = digest equality); B2 = row-pair interleave / prefetch restructuring
-   (reordering class, gate = golden_check margin rule). Never combine B1 and
-   B2 in one verification pass. Note: offline shader stats (air-stat etc.)
-   do NOT ship inside this Xcode — occupancy via runtime DIAG is the
-   available proxy.
-2. attention_f16 slope inefficiency (~3% of bandwidth) — first target after
-   matvec; ~60% of decode time at 7K context is attention.
-3. Decide: commit current work (2 src files + tools + bench/m1max/), and/or
-   derive metal-m1 canonical for `metal_canonical_gate.sh` (old-route digest
-   `c30b2e89d450d563` and family-default 32/32 invariance are on disk to start from).
-4. Deferred by agreement: turbo3 3-bit KV evaluation on M1; MTP/continuous-batch
-   Metal-side effectiveness measurement (`matmul_q4_mm` 16.4% path); 512-vs-256
-   delta cross-check (needs Apple8+ or CUDA machine); PPL with longer context.
-5. For powermetrics runs alongside benches, user starts
-   `sudo powermetrics --samplers gpu_power,cpu_power -i 1000` manually.
+Shipped (all gates passed, docs in this directory):
+- decode tg +26% (lower bound): fp16 magic-number matvec dot default
+  (rollback Q27_METAL_Q4_ARM=r0); bit-identical, golden 64x2 x3 runs.
+- prefill pp +47%: q27_matmul_q4_mm_h default (rollback
+  Q27_METAL_GEMM_HALF_Q4=0); gate-substitution precedent recorded above.
+- GQA defaults family-aware (b256/threshold 1280 on Apple7), grid_m1 data.
+Negative results on record (do not retry without new evidence): matvec B1
+(x-broadcast), manual double-buffer (halfdot4p), 2-chunk unroll (u2),
+b128 grid (device-worse), w2row attention (tg-flat), SSM/GDN kernels
+(shadow, 2.7% ceiling), "GPU idle pool" (profiler artifact — never read
+busy/wall gap from Q27_METAL_PROFILE logs).
+Open but user-closed as "uncertain payoff, medium-large cost":
+- matvec B tail: 264->338 GB/s ceiling needs deep reformulation
+  (mantissa-direct / simdgroup_matrix); ~+10% tg upper bound.
+- prefill post-h4 share unprofiled (needs a harness that does NOT sample
+  per-encoder, or reads gaps only from clean runs).
+If resumed: user agreed prefill inventory first (momentum side), B tail
+second. Optional: share the M4-assumptions-dont-transfer corpus
+(DeltaNet thresholds, r2 arm, 1.7x gate, attention route data) upstream
+with signalnine as an issue — user suggestion, not started.
+Verification checklist for any kernel edit: rebuild tools -> strings | grep
+<kernel_name> -> ops -> golden(margins) -> clean tg/pp A/B (best-of-2;
+differences <2.5% are unmeasurable by this rig).
 
 ## File map (new stuff this session)
 
