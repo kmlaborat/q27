@@ -11,6 +11,22 @@ harness → kernel work). Model under test: Qwen3.6-27B-MTP **q4s** tier
 (`models/qwen36-27b-mtp-q4s.q27`, md5 `7e5454e0c0ded717136ad3e42634ba25`, 15.46 GB,
 tokenizer `models/qwen36-27b-mtp.tok` md5 `bb95b3ca7647ce1cc061c141789e7102`).
 
+## D2 probes (branch m1max/d2-probes, 2026-09-25)
+
+#2 ALIGNMENT: DEAD END. turbo3 50B chunk stride vs 64B-padded: stream floor
+1368 vs 1386us @64K (+1.3% for +28% bytes) — the 50B stride costs nothing;
+coalescing was never the problem. (d2_align_probe.jsonl)
+
+#1 w4row: LIVE WIN. 4-row/tile decode attention (bench arm then engine
+kernel q27_attention_turbo3_gqa_w4, opt-in Q27_METAL_ATT=w4):
+kernel: w4 vs w2 = -23.1/-23.3/-23.4/-23.4/-23.5% at 2048/7168/16K/32K/64K
+(d2_w4row.jsonl) — vs production row-route that is ~-49%.
+Engine tg A/B (turbo3): 7168 12.83 -> 13.45 (+4.8%, no regression).
+64K A/B + golden turbo3 margin gate running (d2_w4_64k_r{1,2}.jsonl);
+predicted ~7.0 t/s (+18% over w2's 5.95) from the step budget.
+If gates pass: promote w4 as default on this branch (w2 stays as
+Q27_METAL_ATT=w2 fallback; row stays as rollback).
+
 ## Phase D FINAL CLOSE (2026-09-25)
 
 Shipped this phase: **w2row default** (turbo3 decode attention 2-row tiles;

@@ -52,7 +52,8 @@ int main(int argc, char** argv) {
         auto buf = [&](size_t bytes) { return [dev newBufferWithLength:bytes options:MTLResourceStorageModeShared]; };
         auto Q = buf((size_t)QH * QS * 4), KC = buf((size_t)MAXSEQ * KVH * HD * 2),
              VC = buf((size_t)MAXSEQ * KVH * HD * 2), PART = buf((size_t)QH * 512 * 258 * 4),   // nb stride up to 512 blocks @64K
-             O = buf((size_t)QH * HD * 4);
+             O = buf((size_t)QH * HD * 4),
+             KCP = buf((size_t)MAXSEQ * KVH * 2 * 64), VCP = buf((size_t)MAXSEQ * KVH * 2 * 64);
         uint16_t* k = (uint16_t*)KC.contents; uint16_t* v = (uint16_t*)VC.contents;
         uint64_t st = 0x2437F11D2646C071ull;
         auto rnd = [&]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
@@ -64,6 +65,15 @@ int main(int argc, char** argv) {
         }
         float* qf = (float*)Q.contents;
         for (uint32_t i = 0; i < QH * QS; i++) qf[i] = ((rnd() & 0xFFFF) / 65536.0f - 0.5f);
+        {   // D2 #2: fill padded buffers (50B payload + 14B pad per chunk)
+            uint8_t* kp = (uint8_t*)KCP.contents; uint8_t* vp = (uint8_t*)VCP.contents;
+            for (uint64_t t = 0; t < MAXSEQ; t++) for (uint h = 0; h < KVH; h++) {
+                uint8_t* dk = kp + (t * KVH + h) * 2 * 64;
+                uint8_t* dv = vp + (t * KVH + h) * 2 * 64;
+                for (int b = 0; b < 100; b++) dk[b] = (uint8_t)rnd();
+                for (int b = 0; b < 100; b++) dv[b] = (uint8_t)rnd();
+            }
+        }
 
         auto q = [dev newCommandQueue];
         std::vector<id<MTLComputePipelineState>> psos;
@@ -83,6 +93,10 @@ int main(int argc, char** argv) {
         collect(bench_lib, "attn_nosm");
         collect(bench_lib, "attn_w2row");
         collect(bench_lib, "attn_t3_w2row");
+        collect(bench_lib, "attn_t3_stream50");
+        collect(bench_lib, "attn_t3_stream64");
+        collect(bench_lib, "attn_t3_w2row_pad");
+        collect(bench_lib, "attn_t3_w4row");
 
         FILE* out = fopen(out_path.c_str(), "w");
         fprintf(stderr, "%-22s %6s %6s %9s %9s %9s\n", "kernel", "seq", "block", "us", "us/token", "KV GB/s");
@@ -101,6 +115,7 @@ int main(int argc, char** argv) {
                     uint32_t block = gqa_arm ? blocks[bi] : 1024;
                     if (plain && bi > 0) continue;
                     uint32_t nb = 1 + (seqs[si] - 1) / block;
+                    const BOOL pad = [n containsString:@"_pad"] || [n containsString:@"stream64"];
                     AttentionGqaArgs ga{QS, seqs[si], QH, KVH, HD, block, nb, 0.0625f};
                     AttentionArgs pa{QS, seqs[si], QH, KVH, HD, 0.0625f};
                     NSUInteger gx = plain ? QH : KVH, gy = plain ? 1 : nb;
@@ -111,8 +126,8 @@ int main(int argc, char** argv) {
                         auto ce = [cb computeCommandEncoder];
                         [ce setComputePipelineState:pso];
                         [ce setBuffer:Q offset:0 atIndex:0];
-                        [ce setBuffer:KC offset:0 atIndex:1];
-                        [ce setBuffer:VC offset:0 atIndex:2];
+                        [ce setBuffer:pad ? KCP : KC offset:0 atIndex:1];
+                        [ce setBuffer:pad ? VCP : VC offset:0 atIndex:2];
                         [ce setBuffer:PART offset:0 atIndex:3];
                         [ce setBytes:&ga length:sizeof(ga) atIndex:4];
                         [ce dispatchThreadgroups:MTLSizeMake(gx, gy, 1) threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
@@ -141,8 +156,8 @@ int main(int argc, char** argv) {
                             auto ce = [cb computeCommandEncoder];
                             [ce setComputePipelineState:pso];
                             [ce setBuffer:Q offset:0 atIndex:0];
-                            [ce setBuffer:VC offset:0 atIndex:2];
-                            [ce setBuffer:KC offset:0 atIndex:1];
+                            [ce setBuffer:pad ? VCP : VC offset:0 atIndex:2];
+                            [ce setBuffer:pad ? KCP : KC offset:0 atIndex:1];
                             [ce setBuffer:PART offset:0 atIndex:3];
                             if (plain) [ce setBytes:&pa length:sizeof(pa) atIndex:4];
                             else       [ce setBytes:&ga length:sizeof(ga) atIndex:4];
@@ -164,7 +179,7 @@ int main(int argc, char** argv) {
                         float us = (float)(CFAbsoluteTimeGetCurrent() - t0) * 1e6f / 8.0f;
                         if (us < best) best = us;
                     }
-                    double kvbytes = [n containsString:@"turbo3"] ? (double)seqs[si] * KVH * 2 * 50 : (double)seqs[si] * KVH * HD * 2 * 2;
+                    double kvbytes = ([n containsString:@"turbo3"]||[n containsString:@"t3"]) ? (double)seqs[si] * KVH * 2 * (pad?64:50) : (double)seqs[si] * KVH * HD * 2 * 2;
                     fprintf(out, "{\"kernel\":\"%s\",\"seq\":%u,\"block\":%u,\"us\":%.3f,\"kvgbs\":%.1f}\n",
                             n.UTF8String, seqs[si], block, best, kvbytes / (best * 1e-6));
                     fprintf(stderr, "%-22s %6u %6u %9.1f %9.2f %9.1f\n", n.UTF8String, seqs[si],
