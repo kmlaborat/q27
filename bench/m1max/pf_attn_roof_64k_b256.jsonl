@@ -1,0 +1,8 @@
+{"kernel":"q27_attention_turbo3_causal_gqa_t2","us":3505152.5}
+{"kernel":"q27_attention_turbo3_causal_gqa_t4","us":4058717.2}
+{"kernel":"pfa_stream","us":323035.1}
+{"kernel":"pfa_noexp","us":3451841.0}
+{"kernel":"pfa_nostage","us":3951476.0}
+{"kernel":"pfa_nomax","us":3453864.8}
+{"kernel":"pfa_nosum","us":3398279.8}
+{"kernel":"t2_plus_merge_rows","us":3542012.0}

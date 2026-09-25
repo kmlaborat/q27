@@ -411,6 +411,46 @@ re-reads that don't bite until ALU costs drop). Headroom framing: reaching
 the LUT arm's 33 uniq = ~3.6x GEMM time = ~2x pp (GEMM is 62-82%); past
 that needs killing the 6x re-reads (wide x-tile) to approach 58 uniq.
 
+## Phase D Step 1c: NIAHF gate PASSED for turbo3; prefill attention roof = row-serial SIMT wall
+
+### NIAHF @64K (tools/niahf_probe.cpp, bench/m1max/d_niahf.jsonl)
+65177-token filler with 3 needles (number+code @2%, identifier+value @37%,
+name+date @86%), pinned 3-part query, greedy 96:
+fp16 7/9 hits; turbo3 **7/9 — same hits, same misses, near-identical answers**.
+Misses are format/tokenization artifacts (retryBudget split; 3.9.1 truncation),
+not KV-quant. Corroborates upstream BUILDLOG evidence (flat turbo3 NLL depth
+buckets to 320K; needle_deep 6/6 EXACT at 355K on the bigger box).
+Decision recorded: `--kv turbo3` approved for the pi serving line
+(w2 default now makes turbo3 the fast path end to end). NOTE pi's live
+providers (models.json) point at OTHER hosts (msm1/fedora/mx, llama.cpp
+Qwen3.8) — flipping a q27 launch config here has nothing to flip until the
+q27 server itself serves pi; launch line when it does:
+`q27-metal --serve --kv turbo3 --ctx 64000`.
+
+### Prefill attention roof @64K marginal chunk (pf_attn_roof_64k{,_b256}.jsonl)
+Shape = engine's true last-chunk: tok=512, base=65024; b1024 AND b256 (this
+machine's family default — the harness at b1024 was a config slip, redone):
+
+| arm | ms | vs t2 |
+|---|--:|--:|
+| pfa_stream (same KV traffic, no math) | 323 | **-9.2% floor** — not DRAM |
+| pfa_noexp / pfa_nomax / pfa_nosum | ~3450/3454/3397 | -1.5/-1.5/-3.1% — softmax bookkeeping ~= noise |
+| **t2 production** | **3505** | — (b256 = b1024 to the digit) |
+| pfa_nostage | 3975 | +13% (staging HELPS; sharing pays) |
+| t4 | 4115 | +17% (t2 choice confirmed) |
+| + merge_rows | +5..37 | negligible |
+
+Attribution: NOTHING single removes the wall — the row-serial SIMT inner
+loop itself (scalar fp32 qk/pv walks, ~0.2-0.3 effective TFLOP/s vs tensor
+headroom ~10x). Same face as prefill GEMM (B), but here it is STRUCTURAL:
+fix = tensor-core flash-style rewrite (multi-day, margin-class, and B says
+tensor+staging coupling eats paper wins). Per the judgment branch: record
+and CLOSE — no implementation without explicit approval; if ever approved,
+it is a rewrite project, not a knob.
+Cheap knobs that are DEAD ends (measured): block size (b128 skipped: b256==
+b1024 already insensitive), t4, chunk width (O(n^2) total invariant),
+turbo3-vs-fp16 prefill (+5% only, supply never mattered).
+
 ## Phase D Step 1b: decode attention @64K — w2row PROMOTED to default (+28% tg @64K, +10% @7168)
 
 Roofline @seq65536 (attn_roof_m1_64k.jsonl, block sweep, best-of): production

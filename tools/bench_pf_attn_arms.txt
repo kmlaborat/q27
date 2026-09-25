@@ -1,0 +1,358 @@
+template <uint TF>
+inline void pfa_noexp_body(device const float *q,
+                                          device const uchar *kc,
+                                          device const uchar *vc,
+                                          device float *partials,
+                                          constant AttentionGqaCausalArgs &args,
+                                          uint3 group, ushort lane, ushort sg,
+                                          threadgroup float (*Kt)[256],
+                                          threadgroup float (*Vt)[256]) {
+    const uint kvh = group.x, blk = group.y, tile0 = group.z * TF;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || tile0 >= args.tokens || sg >= gqa) return;
+    const uint live = min(TF, args.tokens - tile0);
+    const uint p0 = blk * args.block;
+    const uint seq_last = args.base_len + tile0 + live - 1;   // deepest token's visible length
+    if (p0 >= seq_last) return;
+    const uint p1 = min(p0 + args.block, seq_last);
+    const uint qh = kvh * gqa + sg;
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+    device const float *qp[TF];
+    for (uint f = 0; f < TF; f++)
+        qp[f] = q + (ulong)(tile0 + min(f, live - 1)) * args.q_row_stride + (ulong)qh * args.q_stride;
+
+    float acc[TF][8];
+    float m[TF], l[TF];
+    for (uint f = 0; f < TF; f++) {
+        m[f] = -INFINITY; l[f] = 0.0f;
+        for (uint i = 0; i < 8; i++) acc[f][i] = 0.0f;
+    }
+    for (uint t0 = p0; t0 < p1; t0 += 8) {
+        const uint rows = min(8u, p1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rows * 256; idx += threads) {
+            const uint r = idx >> 8, d = idx & 255;
+            device const uchar *kb = kc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
+            device const uchar *vb = vc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
+            Kt[r][d] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
+            Vt[r][d] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < rows; r++) {
+            const uint pos = t0 + r;
+            float partial[TF];
+            for (uint f = 0; f < TF; f++) partial[f] = 0.0f;
+            for (uint d = lane; d < 256; d += 32) {
+                const float k = Kt[r][d];
+                for (uint f = 0; f < TF; f++) partial[f] += qp[f][d] * k;
+            }
+            float corr[TF], w[TF];
+            bool vis[TF];
+            for (uint f = 0; f < TF; f++) {
+                vis[f] = f < live && pos < args.base_len + tile0 + f;
+                corr[f] = 1.0f; w[f] = 0.0f;
+                if (vis[f]) {
+                    const float score = simd_sum(partial[f]) * args.scale;
+                    const float m_new = max(m[f], score);
+                    corr[f] = 1.0f; /*attribution*/            // first iteration: exp(-inf) = 0
+                    w[f] = fmax(score * 0.001f, 0.001f);
+                    l[f] = l[f] * corr[f] + w[f];
+                    m[f] = m_new;
+                }
+            }
+            for (uint d = lane, i = 0; d < 256; d += 32, i++) {
+                const float v = Vt[r][d];
+                for (uint f = 0; f < TF; f++)
+                    if (vis[f]) acc[f][i] = acc[f][i] * corr[f] + w[f] * v;
+            }
+        }
+    }
+    for (uint f = 0; f < live; f++) {
+        if (p0 >= args.base_len + tile0 + f) continue;    // merge never reads this slot
+        device float *ph = partials +
+            (((ulong)(tile0 + f) * args.q_heads + qh) * args.n_blocks_max + blk) * 258;
+        if (lane == 0) { ph[0] = m[f]; ph[1] = l[f]; }
+        for (uint d = lane, i = 0; d < 256; d += 32, i++) ph[2 + d] = acc[f][i];
+    }
+}
+template <uint TF>
+inline void pfa_nostage_body(device const float *q,
+                                          device const uchar *kc,
+                                          device const uchar *vc,
+                                          device float *partials,
+                                          constant AttentionGqaCausalArgs &args,
+                                          uint3 group, ushort lane, ushort sg,
+                                          threadgroup float (*Kt)[256],
+                                          threadgroup float (*Vt)[256]) {
+    const uint kvh = group.x, blk = group.y, tile0 = group.z * TF;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || tile0 >= args.tokens || sg >= gqa) return;
+    const uint live = min(TF, args.tokens - tile0);
+    const uint p0 = blk * args.block;
+    const uint seq_last = args.base_len + tile0 + live - 1;   // deepest token's visible length
+    if (p0 >= seq_last) return;
+    const uint p1 = min(p0 + args.block, seq_last);
+    const uint qh = kvh * gqa + sg;
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+    device const float *qp[TF];
+    for (uint f = 0; f < TF; f++)
+        qp[f] = q + (ulong)(tile0 + min(f, live - 1)) * args.q_row_stride + (ulong)qh * args.q_stride;
+
+    float acc[TF][8];
+    float m[TF], l[TF];
+    for (uint f = 0; f < TF; f++) {
+        m[f] = -INFINITY; l[f] = 0.0f;
+        for (uint i = 0; i < 8; i++) acc[f][i] = 0.0f;
+    }
+    for (uint t0 = p0; t0 < p1; t0 += 8) {
+        const uint rows = min(8u, p1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // nostage arm: staging removed; per-lane device dequant below
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < rows; r++) {
+            const uint pos = t0 + r;
+            float partial[TF];
+            for (uint f = 0; f < TF; f++) partial[f] = 0.0f;
+            for (uint d = lane; d < 256; d += 32) {
+                const float k = turbo_dequant(kc + (((ulong)(t0+r)*args.kv_heads+kvh)*2*50) + (d>>7)*50, d&127);
+                for (uint f = 0; f < TF; f++) partial[f] += qp[f][d] * k;
+            }
+            float corr[TF], w[TF];
+            bool vis[TF];
+            for (uint f = 0; f < TF; f++) {
+                vis[f] = f < live && pos < args.base_len + tile0 + f;
+                corr[f] = 1.0f; w[f] = 0.0f;
+                if (vis[f]) {
+                    const float score = simd_sum(partial[f]) * args.scale;
+                    const float m_new = max(m[f], score);
+                    corr[f] = exp(m[f] - m_new);            // first iteration: exp(-inf) = 0
+                    w[f] = exp(score - m_new);
+                    l[f] = l[f] * corr[f] + w[f];
+                    m[f] = m_new;
+                }
+            }
+            for (uint d = lane, i = 0; d < 256; d += 32, i++) {
+                const float v = turbo_dequant(vc + (((ulong)(t0+r)*args.kv_heads+kvh)*2*50) + (d>>7)*50, d&127);
+                for (uint f = 0; f < TF; f++)
+                    if (vis[f]) acc[f][i] = acc[f][i] * corr[f] + w[f] * v;
+            }
+        }
+    }
+    for (uint f = 0; f < live; f++) {
+        if (p0 >= args.base_len + tile0 + f) continue;    // merge never reads this slot
+        device float *ph = partials +
+            (((ulong)(tile0 + f) * args.q_heads + qh) * args.n_blocks_max + blk) * 258;
+        if (lane == 0) { ph[0] = m[f]; ph[1] = l[f]; }
+        for (uint d = lane, i = 0; d < 256; d += 32, i++) ph[2 + d] = acc[f][i];
+    }
+}
+kernel void pfa_stream(device const float *q [[buffer(0)]],
+        device const uchar *kc [[buffer(1)]], device const uchar *vc [[buffer(2)]],
+        device float *partials [[buffer(3)]],
+        constant AttentionGqaCausalArgs &args [[buffer(4)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint kvh = group.x, blk = group.y;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || sg >= gqa) return;
+    const uint p0 = blk * args.block;
+    const uint seq_last = args.base_len + args.tokens - 1;
+    if (p0 >= seq_last) return;
+    const uint p1 = min(p0 + args.block, seq_last);
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+    float s = 0.0f;
+    for (uint t = p0; t < p1; t++) {
+        device const uchar *kb = kc + ((ulong)t * args.kv_heads + kvh) * 2 * 50;
+        device const uchar *vb = vc + ((ulong)t * args.kv_heads + kvh) * 2 * 50;
+        for (uint d = tid; d < 256; d += threads) {
+            s += turbo_dequant(kb + (d >> 7) * 50, d & 127);
+            s += turbo_dequant(vb + (d >> 7) * 50, d & 127);
+        }
+    }
+    s = simd_sum(s);
+    if (lane == 0 && group.z == 0) partials[(ulong)kvh * args.n_blocks_max + blk] += s;
+}
+kernel void pfa_noexp(device const float *q [[buffer(0)]], device const uchar *kc [[buffer(1)]],
+        device const uchar *vc [[buffer(2)]], device float *partials [[buffer(3)]],
+        constant AttentionGqaCausalArgs &args [[buffer(4)]], uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float Kt[8][256], Vt[8][256];
+    pfa_noexp_body<2>(q, kc, vc, partials, args, group, lane, sg, Kt, Vt);
+}
+kernel void pfa_nostage(device const float *q [[buffer(0)]], device const uchar *kc [[buffer(1)]],
+        device const uchar *vc [[buffer(2)]], device float *partials [[buffer(3)]],
+        constant AttentionGqaCausalArgs &args [[buffer(4)]], uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float Kt[8][256], Vt[8][256];
+    (void)Kt; (void)Vt;
+    pfa_nostage_body<2>(q, kc, vc, partials, args, group, lane, sg, Kt, Vt);
+}
+template <uint TF>
+inline void pfa_nomax_body(device const float *q,
+                                          device const uchar *kc,
+                                          device const uchar *vc,
+                                          device float *partials,
+                                          constant AttentionGqaCausalArgs &args,
+                                          uint3 group, ushort lane, ushort sg,
+                                          threadgroup float (*Kt)[256],
+                                          threadgroup float (*Vt)[256]) {
+    const uint kvh = group.x, blk = group.y, tile0 = group.z * TF;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || tile0 >= args.tokens || sg >= gqa) return;
+    const uint live = min(TF, args.tokens - tile0);
+    const uint p0 = blk * args.block;
+    const uint seq_last = args.base_len + tile0 + live - 1;   // deepest token's visible length
+    if (p0 >= seq_last) return;
+    const uint p1 = min(p0 + args.block, seq_last);
+    const uint qh = kvh * gqa + sg;
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+    device const float *qp[TF];
+    for (uint f = 0; f < TF; f++)
+        qp[f] = q + (ulong)(tile0 + min(f, live - 1)) * args.q_row_stride + (ulong)qh * args.q_stride;
+
+    float acc[TF][8];
+    float m[TF], l[TF];
+    for (uint f = 0; f < TF; f++) {
+        m[f] = -INFINITY; l[f] = 0.0f;
+        for (uint i = 0; i < 8; i++) acc[f][i] = 0.0f;
+    }
+    for (uint t0 = p0; t0 < p1; t0 += 8) {
+        const uint rows = min(8u, p1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rows * 256; idx += threads) {
+            const uint r = idx >> 8, d = idx & 255;
+            device const uchar *kb = kc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
+            device const uchar *vb = vc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
+            Kt[r][d] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
+            Vt[r][d] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < rows; r++) {
+            const uint pos = t0 + r;
+            float partial[TF];
+            for (uint f = 0; f < TF; f++) partial[f] = 0.0f;
+            for (uint d = lane; d < 256; d += 32) {
+                const float k = Kt[r][d];
+                for (uint f = 0; f < TF; f++) partial[f] += qp[f][d] * k;
+            }
+            float corr[TF], w[TF];
+            bool vis[TF];
+            for (uint f = 0; f < TF; f++) {
+                vis[f] = f < live && pos < args.base_len + tile0 + f;
+                corr[f] = 1.0f; w[f] = 0.0f;
+                if (vis[f]) {
+                    const float score = simd_sum(partial[f]) * args.scale;
+                    const float m_new = m[f] + 1.0f;   // attribution: no max chain
+                    corr[f] = 1.0f;            // first iteration: exp(-inf) = 0
+                    w[f] = fmax(score,0.001f)*0.001f;
+                    l[f] = l[f] * corr[f] + w[f];
+                    m[f] = m_new;
+                }
+            }
+            for (uint d = lane, i = 0; d < 256; d += 32, i++) {
+                const float v = Vt[r][d];
+                for (uint f = 0; f < TF; f++)
+                    if (vis[f]) acc[f][i] = acc[f][i] * corr[f] + w[f] * v;
+            }
+        }
+    }
+    for (uint f = 0; f < live; f++) {
+        if (p0 >= args.base_len + tile0 + f) continue;    // merge never reads this slot
+        device float *ph = partials +
+            (((ulong)(tile0 + f) * args.q_heads + qh) * args.n_blocks_max + blk) * 258;
+        if (lane == 0) { ph[0] = m[f]; ph[1] = l[f]; }
+        for (uint d = lane, i = 0; d < 256; d += 32, i++) ph[2 + d] = acc[f][i];
+    }
+}
+kernel void pfa_nomax(device const float *q [[buffer(0)]], device const uchar *kc [[buffer(1)]],
+        device const uchar *vc [[buffer(2)]], device float *partials [[buffer(3)]],
+        constant AttentionGqaCausalArgs &args [[buffer(4)]], uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float Kt[8][256], Vt[8][256];
+    pfa_nomax_body<2>(q, kc, vc, partials, args, group, lane, sg, Kt, Vt);
+}
+template <uint TF>
+inline void pfa_nosum_body(device const float *q,
+                                          device const uchar *kc,
+                                          device const uchar *vc,
+                                          device float *partials,
+                                          constant AttentionGqaCausalArgs &args,
+                                          uint3 group, ushort lane, ushort sg,
+                                          threadgroup float (*Kt)[256],
+                                          threadgroup float (*Vt)[256]) {
+    const uint kvh = group.x, blk = group.y, tile0 = group.z * TF;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || tile0 >= args.tokens || sg >= gqa) return;
+    const uint live = min(TF, args.tokens - tile0);
+    const uint p0 = blk * args.block;
+    const uint seq_last = args.base_len + tile0 + live - 1;   // deepest token's visible length
+    if (p0 >= seq_last) return;
+    const uint p1 = min(p0 + args.block, seq_last);
+    const uint qh = kvh * gqa + sg;
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+    device const float *qp[TF];
+    for (uint f = 0; f < TF; f++)
+        qp[f] = q + (ulong)(tile0 + min(f, live - 1)) * args.q_row_stride + (ulong)qh * args.q_stride;
+
+    float acc[TF][8];
+    float m[TF], l[TF];
+    for (uint f = 0; f < TF; f++) {
+        m[f] = -INFINITY; l[f] = 0.0f;
+        for (uint i = 0; i < 8; i++) acc[f][i] = 0.0f;
+    }
+    for (uint t0 = p0; t0 < p1; t0 += 8) {
+        const uint rows = min(8u, p1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rows * 256; idx += threads) {
+            const uint r = idx >> 8, d = idx & 255;
+            device const uchar *kb = kc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
+            device const uchar *vb = vc + ((ulong)(t0 + r) * args.kv_heads + kvh) * 2 * 50;
+            Kt[r][d] = turbo_dequant(kb + (d >> 7) * 50, d & 127);
+            Vt[r][d] = turbo_dequant(vb + (d >> 7) * 50, d & 127);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < rows; r++) {
+            const uint pos = t0 + r;
+            float partial[TF];
+            for (uint f = 0; f < TF; f++) partial[f] = 0.0f;
+            for (uint d = lane; d < 256; d += 32) {
+                const float k = Kt[r][d];
+                for (uint f = 0; f < TF; f++) partial[f] += qp[f][d] * k;
+            }
+            float corr[TF], w[TF];
+            bool vis[TF];
+            for (uint f = 0; f < TF; f++) {
+                vis[f] = f < live && pos < args.base_len + tile0 + f;
+                corr[f] = 1.0f; w[f] = 0.0f;
+                if (vis[f]) {
+                    const float score = partial[f] * args.scale; // attribution: no shuffle
+                    const float m_new = max(m[f], score);
+                    corr[f] = exp(m[f] - m_new);            // first iteration: exp(-inf) = 0
+                    w[f] = exp(score - m_new);
+                    l[f] = l[f] * corr[f] + w[f];
+                    m[f] = m_new;
+                }
+            }
+            for (uint d = lane, i = 0; d < 256; d += 32, i++) {
+                const float v = Vt[r][d];
+                for (uint f = 0; f < TF; f++)
+                    if (vis[f]) acc[f][i] = acc[f][i] * corr[f] + w[f] * v;
+            }
+        }
+    }
+    for (uint f = 0; f < live; f++) {
+        if (p0 >= args.base_len + tile0 + f) continue;    // merge never reads this slot
+        device float *ph = partials +
+            (((ulong)(tile0 + f) * args.q_heads + qh) * args.n_blocks_max + blk) * 258;
+        if (lane == 0) { ph[0] = m[f]; ph[1] = l[f]; }
+        for (uint d = lane, i = 0; d < 256; d += 32, i++) ph[2 + d] = acc[f][i];
+    }
+}
+kernel void pfa_nosum(device const float *q [[buffer(0)]], device const uchar *kc [[buffer(1)]],
+        device const uchar *vc [[buffer(2)]], device float *partials [[buffer(3)]],
+        constant AttentionGqaCausalArgs &args [[buffer(4)]], uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float Kt[8][256], Vt[8][256];
+    pfa_nosum_body<2>(q, kc, vc, partials, args, group, lane, sg, Kt, Vt);
+}

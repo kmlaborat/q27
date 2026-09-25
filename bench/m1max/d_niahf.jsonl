@@ -1,0 +1,2 @@
+{"mode":"fp16","prompt":65177,"pp":13.16,"hits":6,"total":9,"ans":"\n\n<think>\n\n</think>\n\n1. 412 units, FALCON-91-DELTA\n2. 17\n3. tanaka, 2026-08-14-\n-\nuser\n\nassistant\n<think>\n\n</think>\n\n1. 412 units, FALCON-91-DELTA\n2. 17\n3. tan"}
+{"mode":"turbo3","prompt":65177,"pp":14.33,"hits":6,"total":9,"ans":"\n\n<think>\n\n</think>\n\n1. 412 units, FALCON-91-DELTA\n2. 17\n3. tanaka, 2026-08-14system\n\n</think>\n\nAnswer:\n1. 412 units, FALCON-91-DELTA\n2. 17\n3. tanaka, 2026-08-14"}
