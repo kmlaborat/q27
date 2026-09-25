@@ -1,0 +1,4 @@
+q27 Metal: model upload path: whole-mapping (mapping 14.40 GiB, max buffer 18.72 GiB)
+delta: load 2.7 s + ingest 32648 tok in 3498 s = 9.3 t/s (window 32752..65400)
+delta: effective whole-session-equivalent pp = 18.6 t/s (59 min vs cold ~83 min)
+delta: decode post-resume ok, first=3841

@@ -411,6 +411,33 @@ re-reads that don't bite until ALU costs drop). Headroom framing: reaching
 the LUT arm's 33 uniq = ~3.6x GEMM time = ~2x pp (GEMM is 62-82%); past
 that needs killing the 6x re-reads (wide x-tile) to approach 58 uniq.
 
+## Phase D Step 1a: prefix-snapshot resume MEASURED (`tools/prefix_probe.cpp`)
+
+Identity: resume(save@4000 + load + delta-ingest to 6000) greedy stream ==
+continuous stream byte-identical (MATCH). Probe gotcha worth remembering:
+`ingest_prompt` defaults reset_first=true — calling it after load_state
+without reset_first=false silently discards the loaded KV (symptom: streams
+"mismatch" but are actually a fresh short-context run; server path at
+metal_server.cpp does it right).
+
+Costs (fp16 KV, synthetic prompt; bench/m1max/d_step1a_{cost,delta}.log):
+- save @16384: 11.3 s / 1.21 GiB (~109 MB/s — fsync/plain-file-I/O bound,
+  linear in context: 32K ~23 s, 64K ~46 s expected)
+- load @16384: 1.4 s (~880 MB/s); load @32752: 2.7 s — LOAD IS CHEAP, SAVE
+  IS THE WRITE BILL
+- 64K economics: load@32752 (2.7 s) + delta-ingest 32648 tok = 3498 s ->
+  LOCAL rate 9.3 t/s for the 32K..64K window (SLOWER than cold's 13.1
+  average — tail positions pay full-context attention). Whole-64K-equivalent
+  58 min vs cold 83 min: **prefix reuse saves only ~30%, not 50%**, because
+  the expensive tokens are exactly the late ones whose attention reads all
+  64K of KV. Prefix cache converts "re-ingest head" into nearly free; it
+  cannot discount the O(ctx) per-token cost of the tail.
+- Implication for real use: multi-turn agent savings ride only on the
+  unchanged head; after COMPACTION the summary is a NEW prefix (no hit at
+  all) and the session repays the full curve. Compute is still the wall ->
+  Step 1b attribution (conditional, per user gate) targets the late-position
+  window where 9.3 t/s lives.
+
 ## Phase D Step 0 DONE: 64K on 32GB — fits, no swap, flat footprint, compute is the wall
 
 Step 0.2 (overrun behavior): engine rejects cleanly BEFORE allocation —
