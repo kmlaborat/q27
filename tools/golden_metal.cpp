@@ -105,7 +105,10 @@ int main(int argc, char** argv) try {
     }
 
     q27::Tokenizer tokenizer(argv[2]);
-    q27::MetalEngine engine(argv[1], ctx, false);
+    // m1max Phase D: allow turbo3-path golden runs (w2 gate only affects the
+    // turbo3 decode path, so fp16-only golden could never gate it).
+    const bool gold_t3 = getenv("Q27_GOLDEN_TURBO3") != nullptr;
+    q27::MetalEngine engine(argv[1], ctx, gold_t3);
 
     if (mode == "golden") {
         std::vector<std::string> prompts;

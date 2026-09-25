@@ -65,6 +65,23 @@ int main(int argc, char** argv){
         return same?0:1;
     }
 
+    if (mode=="tg"){                 // clean tg at short ctx, both KV modes (regression probe)
+        auto p = synth_prompt(tok, 7168);
+        const bool t3 = std::string(argv[argc-1]) == "turbo3";
+        {
+            MetalEngine eng(model, 8192, t3);
+            // subtract ingest via separate timed run; step() loops >128 need pool
+            // drains we can't express in .cpp — use generate() which self-pools.
+            eng.reset(); double t0=now(); eng.ingest_prompt(p, false); double ting=now()-t0;
+            eng.reset(); t0=now(); auto g = eng.generate(p, 160); double tall=now()-t0;
+            // generate = ingest + 160 decodes + one extra forward; approx:
+            double tg = 160.0/((tall - ting)/160.0*160.0/161.0*161.0/160.0); (void)tg;
+            printf("tg %s @7168: %.2f t/s (ingest %.0fs total %.0fs)\n", t3?"turbo3":"fp16 ",
+                   161.0/(tall-ting), ting, tall);
+        }
+        return 0;
+    }
+
     if (mode=="cost"){              // save cost vs position
         MetalEngine eng(model, CTX, turbo3);
         auto p = synth_prompt(tok, 16384);

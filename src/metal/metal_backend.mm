@@ -805,9 +805,12 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         impl_->nll_rows_p = make_pipeline(impl_->device, impl_->library, @"q27_nll_rows");
         impl_->attention_f16_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_f16_gqa");
         impl_->attention_turbo3_gqa_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa");
-        // Opt-in 2-row/tile decode attention (m1max: -33..-35% per dispatch).
-        // fp reassociation vs the default route, so golden-margin gated.
-        if (const char* att = getenv("Q27_METAL_ATT"); att && strcmp(att, "w2") == 0)
+        // 2-row/tile decode attention — DEFAULT since m1max Phase D (M1 Max:
+        // kernel -34%, tg +28% @64K / +10% @7168, clean A/B; golden turbo3
+        // digest-identical base vs w2, 64 prompts). Rollback: Q27_METAL_ATT=row.
+        // fp reassociation vs the row route, so golden-margin gated class.
+        const char* att_env = getenv("Q27_METAL_ATT");
+        if (!att_env || strcmp(att_env, "row") != 0)
             impl_->attention_turbo3_gqa_w2_p =
                 make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa_w2");
         impl_->attention_gqa_merge_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_gqa_merge");

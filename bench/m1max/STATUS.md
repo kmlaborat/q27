@@ -411,6 +411,42 @@ re-reads that don't bite until ALU costs drop). Headroom framing: reaching
 the LUT arm's 33 uniq = ~3.6x GEMM time = ~2x pp (GEMM is 62-82%); past
 that needs killing the 6x re-reads (wide x-tile) to approach 58 uniq.
 
+## Phase D Step 1b: decode attention @64K — w2row PROMOTED to default (+28% tg @64K, +10% @7168)
+
+Roofline @seq65536 (attn_roof_m1_64k.jsonl, block sweep, best-of): production
+turbo3_gqa 8642us/layer = 3.0 GB/s = 0.9% of DRAM roof; pure fp16 stream arm
+740us (181 GB/s) proves supply exists. Component removals are all modest
+(nostage -23%, w2row -34%, noexp/nosm +5/+6%): again coupling-shaped (B's
+lesson), but w2row's -34% SURFACES at 64K because attention share of a step
+is ~66% there (147ms attn of 221ms/token, arithmetic matches tg 4.52).
+
+Clean serial A/B (turbo3 KV; NO GPU concurrency — first batch of "turbo3
+regressions" and OOMs were MY OWN concurrent background probes; serial
+re-runs clean, ④ lesson self-re-learned the hard way):
+
+| config | pp | tg |
+|---|--:|--:|
+| turbo3 row-route @64K | 14.29 | 4.64 |
+| turbo3 w2-route @64K | 14.28 | 5.95 (rep2: 5.96) = +28% |
+| turbo3 row-route @7168 | 48.18 | 11.45 |
+| turbo3 w2-route @7168 | 48.21 | 12.59 = +10% |
+| fp16 @64K (earlier) | 13.1 | 4.52 |
+
+Note turbo3-vs-fp16 at 64K is only +2.6/+1.4% tg — quarter the KV bytes
+doesn't help a kernel running at 3 GB/s; confirms latency/coupling-bound,
+not DRAM-bound. w2 helps because it shortens the per-threadgroup chain.
+
+Gates: test-metal-ops OK; turbo3-path golden 64 prompts x 24 gen base vs
+w2: DIGEST-IDENTICAL (a56bc64974d06497, 0 branches). The eeb855b-era golden
+ran on the fp16 path where the env gate is a NO-OP — that gate never saw
+w2; closed now (golden_metal honors Q27_GOLDEN_TURBO3=1).
+Promotion: metal_backend.mm builds w2 pipeline UNLESS Q27_METAL_ATT=row
+(rollback env verified 11.48 vs default 12.61 @7168). eeb855b's "NEGATIVE
+at tg" verdict was short-context + (re-examined) likely contaminated:
+current same-shape A/B shows +10%. Lesson: a "shadow" verdict is a statement
+about the regime measured, not the kernel — re-test shadow candidates when
+the share structure changes (64K did exactly that).
+
 ## Phase D Step 1a: prefix-snapshot resume MEASURED (`tools/prefix_probe.cpp`)
 
 Identity: resume(save@4000 + load + delta-ingest to 6000) greedy stream ==

@@ -48,10 +48,10 @@ int main(int argc, char** argv) {
         if (!bench_lib) { fprintf(stderr, "bench lib: %s\n", err.localizedDescription.UTF8String); return 1; }
 
         const uint32_t QH = 24, KVH = 4, HD = 256, GQA = 6, QS = 256;
-        const uint32_t MAXSEQ = 8192;
+        const uint32_t MAXSEQ = 65536;
         auto buf = [&](size_t bytes) { return [dev newBufferWithLength:bytes options:MTLResourceStorageModeShared]; };
         auto Q = buf((size_t)QH * QS * 4), KC = buf((size_t)MAXSEQ * KVH * HD * 2),
-             VC = buf((size_t)MAXSEQ * KVH * HD * 2), PART = buf((size_t)QH * 64 * 258 * 4),
+             VC = buf((size_t)MAXSEQ * KVH * HD * 2), PART = buf((size_t)QH * 512 * 258 * 4),   // nb stride up to 512 blocks @64K
              O = buf((size_t)QH * HD * 4);
         uint16_t* k = (uint16_t*)KC.contents; uint16_t* v = (uint16_t*)VC.contents;
         uint64_t st = 0x2437F11D2646C071ull;
@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
 
         FILE* out = fopen(out_path.c_str(), "w");
         fprintf(stderr, "%-22s %6s %6s %9s %9s %9s\n", "kernel", "seq", "block", "us", "us/token", "KV GB/s");
-        uint32_t seqs[] = {512, 1280, 2048, 4096, 7168};
+        uint32_t seqs[] = {512, 2048, 7168, 16384, 32768, 65536};
         uint32_t blocks[] = {256, 1024, 128};
         for (uint32_t si = 0; si < sizeof(seqs)/sizeof(*seqs); si++) {
             for (uint32_t bi = 0; bi < sizeof(blocks)/sizeof(*blocks); bi++) {
@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
                     BOOL plain = [n isEqualToString:@"q27_attention_turbo3"] || [n isEqualToString:@"q27_attention_f16"];
                     BOOL merge = [n isEqualToString:@"q27_attention_gqa_merge"];
                     if (merge) continue;                     // timed with parent
-                    if (plain && seqs[si] > 512) continue;  // engine routes >=1280 to gqa
+                    if (plain) continue;   // turbo3-only run: engine routes >=1280 to gqa; plain f16 path timed in earlier runs  // engine routes >=1280 to gqa
                     uint32_t block = gqa_arm ? blocks[bi] : 1024;
                     if (plain && bi > 0) continue;
                     uint32_t nb = 1 + (seqs[si] - 1) / block;
