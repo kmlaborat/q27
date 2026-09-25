@@ -24,8 +24,13 @@ kernel: w4 vs w2 = -23.1/-23.3/-23.4/-23.4/-23.5% at 2048/7168/16K/32K/64K
 Engine tg A/B (turbo3): 7168 12.83 -> 13.45 (+4.8%, no regression).
 64K A/B + golden turbo3 margin gate running (d2_w4_64k_r{1,2}.jsonl);
 predicted ~7.0 t/s (+18% over w2's 5.95) from the step budget.
-If gates pass: promote w4 as default on this branch (w2 stays as
-Q27_METAL_ATT=w2 fallback; row stays as rollback).
+GATES ALL PASSED: 64K tg 6.90/6.89 (r1/r2) vs w2 5.95/5.96 = +15.8%
+reproducible; golden turbo3 w2ref-vs-w4 digest-identical (64 prompts,
+0 branches); ops green under Q27_METAL_ATT=w4. PROMOTED: w4 is the branch
+default; fallback ladder w2=12.83 / row=11.64 / w4=13.45 @7168 (all
+same-binary, rebuilt). Stale-binary trap re-encountered and caught (default
+looked like 12.83 until bench_metal was rebuilt — the campaign's own
+checklist item, biting exactly as documented).
 
 ## Phase D FINAL CLOSE (2026-09-25)
 

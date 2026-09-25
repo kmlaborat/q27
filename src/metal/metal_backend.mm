@@ -815,9 +815,11 @@ MetalBackend::MetalBackend() : impl_(new Impl) {
         if (!att_env || strcmp(att_env, "row") != 0)
             impl_->attention_turbo3_gqa_w2_p =
                 make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa_w2");
-        // D2: 4-row/tile variant. Opt-in via Q27_METAL_ATT=w4 until the
-        // engine-level tg A/B + golden margin gate pass on this branch.
-        if (att_env && strcmp(att_env, "w4") == 0)
+        // D2: 4-row/tile variant — DEFAULT on this branch after passing:
+        // kernel -23.5% vs w2 at all depths, tg +15.8% @64K (6.90/6.89
+        // vs 5.95/5.96), +4.8% @7168, golden turbo3 digest-identical,
+        // ops green under w4. Fallbacks: Q27_METAL_ATT=w2 / =row.
+        if (!att_env || strcmp(att_env, "w4") == 0)
             impl_->attention_turbo3_gqa_w4_p =
                 make_pipeline(impl_->device, impl_->library, @"q27_attention_turbo3_gqa_w4");
         impl_->attention_gqa_merge_p = make_pipeline(impl_->device, impl_->library, @"q27_attention_gqa_merge");
