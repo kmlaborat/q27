@@ -11,6 +11,29 @@ harness → kernel work). Model under test: Qwen3.6-27B-MTP **q4s** tier
 (`models/qwen36-27b-mtp-q4s.q27`, md5 `7e5454e0c0ded717136ad3e42634ba25`, 15.46 GB,
 tokenizer `models/qwen36-27b-mtp.tok` md5 `bb95b3ca7647ce1cc061c141789e7102`).
 
+## Phase D FINAL CLOSE (2026-09-25)
+
+Shipped this phase: **w2row default** (turbo3 decode attention 2-row tiles;
+tg +28% @64K 4.64->5.95/+10% @7168, golden turbo3 digest-identical, rollback
+`Q27_METAL_ATT=row`). Approved-by-gate: **`--kv turbo3` for serving**
+(NIAHF@64K 9/9 identical fp16 vs turbo3; corroborates upstream 355K needle
+result). Decision pending USER, not technical: pi currently serves from OTHER
+hosts (llama.cpp Qwen3.8 via msm1/fedora/mx) — this machine's q27 never
+served pi; flipping means launching `q27-metal --serve --kv turbo3
+--ctx 64000` and repointing a provider. 64K capacity on 32GB: fits
+(fp16 resv 5.15 GiB of 13 GiB budget; turbo3 4x less); re-ingest leak-free;
+budget-gate refuses overrun cleanly. Wall at 64K = compute: pp 14.3 t/s
+cold-ingest ~83 min (turbo3 76), prefix reuse saves ~30% NOT 50% (tail
+positions pay full-context attention), pi-vcc compaction = new prefix = 0
+cache hits (byte-level fact, mechanism-agnostic). Prefill attention @64K
+wall = row-serial SIMT structure (stream floor 9%, bookkeeping ~3%,
+block-size insensitive, staging helps) — CLOSED as rewrite-class
+(tensor-core FlashAttention-style, days, B-coupling risk); if ever pursued,
+independent project. All six instruction-doc phases for this machine now
+closed or parked with attribution. Verification holes closed en route:
+golden never exercised turbo3 (Q27_GOLDEN_TURBO3), GPU-concurrency
+contamination (serial-only rule), ingest_prompt reset_first trap.
+
 ## TL;DR — where things stand
 
 1. **DeltaNet occupancy bug: FIXED and verified.** The 512-thread gate in
