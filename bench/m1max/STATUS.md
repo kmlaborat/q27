@@ -11,6 +11,37 @@ harness → kernel work). Model under test: Qwen3.6-27B-MTP **q4s** tier
 (`models/qwen36-27b-mtp-q4s.q27`, md5 `7e5454e0c0ded717136ad3e42634ba25`, 15.46 GB,
 tokenizer `models/qwen36-27b-mtp.tok` md5 `bb95b3ca7647ce1cc061c141789e7102`).
 
+## #3 fp16 w4 port (branch m1max/f16-w4, 2026-09-26) — EXPLORATORY, default unchanged
+
+Purpose: make "turbo3 wins" a TESTED conclusion, not an untested one.
+Ported the 4-row chain-shortening to the fp16 KV path:
+q27_attention_f16_gqa_w4, OPT-IN via Q27_METAL_ATT=w4 (fp16 default
+stays the row route; turbo3 default stays w4).
+
+Harness fix first: q27_attention_f16_gqa was excluded from the block sweep
+(fixed block=1024 -> 16 threadgroups @2048 = starved, baseline looked 10x
+slow). Added to gqa_arm sweep; fair numbers (f16_w4_roof2.jsonl):
+  f16w4 vs f16row: -45.6/-48.6/-46.5/-46.9/-47.4% at 2048/7168/16K/32K/64K
+  (f16w2 sits between: -31 to -33%)
+
+Engine A/B (fp16, serial, same binaries):
+  @7168: row 11.52 -> w4 13.35 (+15.9%)
+  @64K:  row  4.51 -> w4  6.59 (+46.1%)
+
+GATES: golden fp16 row-vs-w4 digest-IDENTICAL 64/64 (strongest class —
+no dequant involved, as predicted); ops green under Q27_METAL_ATT=w4.
+
+FINAL HEAD-TO-HEAD (tg t/s, this machine):
+  @7168: fp16row 11.52 | fp16w4 13.35 | turbo3w4 13.45  (t3 +0.7%)
+  @64K:  fp16row  4.51 | fp16w4  6.59 | turbo3w4  6.90  (t3 +4.7%)
+Why so close despite 10x KV bytes: f16w4 runs at ~110GB/s (near roof,
+bandwidth-efficient); turbo3w4 is dequant-latency-bound at ~12GB/s. The
+quantization bandwidth advantage is largely CANCELLED at w4 because the
+remaining cost is no longer KV streaming. turbo3 still wins AND saves 4x
+KV memory -> serving recommendation unchanged.
+Stale-binary trap third contact: chain started against a make that had
+failed; caught before trusting numbers, rebuilt, re-ran.
+
 ## D2 probes (branch m1max/d2-probes, 2026-09-25)
 
 #2 ALIGNMENT: DEAD END. turbo3 50B chunk stride vs 64B-padded: stream floor
