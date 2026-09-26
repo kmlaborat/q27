@@ -4975,6 +4975,93 @@ kernel void q27_attention_f16_gqa(device const float *q [[buffer(0)]],
     if (lane == 0) { ph[0] = m; ph[1] = l; }
     for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++) ph[2 + d] = acc[i];
 }
+kernel void q27_attention_f16_gqa_w4(device const float *q [[buffer(0)]],
+                                   device const half *kc [[buffer(1)]],
+                                   device const half *vc [[buffer(2)]],
+                                   device float *partials [[buffer(3)]],
+                                   constant AttentionGqaArgs &args [[buffer(4)]],
+                                   uint2 group [[threadgroup_position_in_grid]],
+                                   ushort lane [[thread_index_in_simdgroup]],
+                                   ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint kvh = group.x, blk = group.y;
+    const uint gqa = args.q_heads / args.kv_heads;
+    if (kvh >= args.kv_heads || blk >= args.n_blocks || sg >= gqa) return;
+    const uint p0 = blk * args.block;
+    const uint p1 = min(p0 + args.block, args.seq_len);
+    const uint qh = kvh * gqa + sg;
+    device const float *qh_ptr = q + (ulong)qh * args.q_stride;
+    const uint tid = (uint)sg * 32 + lane, threads = gqa * 32;
+
+    threadgroup float Kt[8][256], Vt[8][256];
+    float acc[8];                       // head_dim <= 256 -> at most 8 dims per lane
+    for (uint i = 0; i < 8; i++) acc[i] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint t0 = p0; t0 < p1; t0 += 8) {
+        const uint rows = min(8u, p1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rows * args.head_dim; idx += threads) {
+            const uint r = idx / args.head_dim, d = idx % args.head_dim;
+            const ulong row = ((ulong)(t0 + r) * args.kv_heads + kvh) * args.head_dim;
+            Kt[r][d] = float(kc[row + d]);
+            Vt[r][d] = float(vc[row + d]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint r = 0;
+        for (; r + 3 < rows; r += 4) {
+            float pa = 0.0f, pb = 0.0f, pc = 0.0f, pd = 0.0f;
+            for (uint d = lane; d < args.head_dim; d += 32) {
+                pa += qh_ptr[d] * Kt[r][d];
+                pb += qh_ptr[d] * Kt[r + 1][d];
+                pc += qh_ptr[d] * Kt[r + 2][d];
+                pd += qh_ptr[d] * Kt[r + 3][d];
+            }
+            const float sa = simd_sum(pa) * args.scale;
+            const float sb = simd_sum(pb) * args.scale;
+            const float sc = simd_sum(pc) * args.scale;
+            const float sd = simd_sum(pd) * args.scale;
+            const float m_new = max(max(m, sa), max(max(sb, sc), sd));
+            const float corr = exp(m - m_new);
+            const float wa = exp(sa - m_new), wb = exp(sb - m_new);
+            const float wc = exp(sc - m_new), wd = exp(sd - m_new);
+            l = l * corr + wa + wb + wc + wd;
+            for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+                acc[i] = acc[i] * corr + wa * Vt[r][d] + wb * Vt[r + 1][d]
+                                   + wc * Vt[r + 2][d] + wd * Vt[r + 3][d];
+            m = m_new;
+        }
+        for (; r + 1 < rows; r += 2) {
+            float pa = 0.0f, pb = 0.0f;
+            for (uint d = lane; d < args.head_dim; d += 32) {
+                pa += qh_ptr[d] * Kt[r][d];
+                pb += qh_ptr[d] * Kt[r + 1][d];
+            }
+            const float sa = simd_sum(pa) * args.scale;
+            const float sb = simd_sum(pb) * args.scale;
+            const float m_new = max(m, max(sa, sb));
+            const float corr = exp(m - m_new);
+            const float wa = exp(sa - m_new), wb = exp(sb - m_new);
+            l = l * corr + wa + wb;
+            for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+                acc[i] = acc[i] * corr + wa * Vt[r][d] + wb * Vt[r + 1][d];
+            m = m_new;
+        }
+        if (r < rows) {
+            float partial = 0.0f;
+            for (uint d = lane; d < args.head_dim; d += 32) partial += qh_ptr[d] * Kt[r][d];
+            const float score = simd_sum(partial) * args.scale;
+            const float m_new = max(m, score);
+            const float corr = exp(m - m_new);
+            const float w = exp(score - m_new);
+            l = l * corr + w;
+            for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++)
+                acc[i] = acc[i] * corr + w * Vt[r][d];
+            m = m_new;
+        }
+    }
+    device float *ph = partials + ((ulong)qh * args.n_blocks + blk) * 258;
+    if (lane == 0) { ph[0] = m; ph[1] = l; }
+    for (uint d = lane, i = 0; d < args.head_dim; d += 32, i++) ph[2 + d] = acc[i];
+}
 
 kernel void q27_attention_turbo3_gqa(device const float *q [[buffer(0)]],
                                       device const uchar *kc [[buffer(1)]],

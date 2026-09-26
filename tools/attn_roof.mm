@@ -86,6 +86,7 @@ int main(int argc, char** argv) {
         collect(prod_lib, "q27_attention_turbo3_gqa");
         collect(prod_lib, "q27_attention_turbo3");
         collect(prod_lib, "q27_attention_f16");
+        collect(prod_lib, "q27_attention_f16_gqa");  // actual f16 decode baseline for #3
         collect(bench_lib, "attn_empty");
         collect(bench_lib, "attn_stream");
         collect(bench_lib, "attn_noexp");
@@ -97,6 +98,7 @@ int main(int argc, char** argv) {
         collect(bench_lib, "attn_t3_stream64");
         collect(bench_lib, "attn_t3_w2row_pad");
         collect(bench_lib, "attn_t3_w4row");
+        collect(bench_lib, "attn_f16_w4row");
 
         FILE* out = fopen(out_path.c_str(), "w");
         fprintf(stderr, "%-22s %6s %6s %9s %9s %9s\n", "kernel", "seq", "block", "us", "us/token", "KV GB/s");
