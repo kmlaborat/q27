@@ -1,0 +1,4 @@
+q27 Metal: model upload path: whole-mapping (mapping 14.40 GiB, max buffer 18.72 GiB)
+device=Apple M1 Max recommendedMaxWorkingSetSize=26.00 GiB load=4.76 s
+prompt-file: 97080 tokens from bench/m1max/step2_corpus64k.txt
+seq=7168  gen=128  pp=    47.4 t/s  tg= 13.35 t/s  mem internal=0.20 GiB

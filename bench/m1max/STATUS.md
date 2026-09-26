@@ -11,6 +11,41 @@ harness → kernel work). Model under test: Qwen3.6-27B-MTP **q4s** tier
 (`models/qwen36-27b-mtp-q4s.q27`, md5 `7e5454e0c0ded717136ad3e42634ba25`, 15.46 GB,
 tokenizer `models/qwen36-27b-mtp.tok` md5 `bb95b3ca7647ce1cc061c141789e7102`).
 
+## Phase D Step 2: MTP x KV 2x2 @64K (2026-09-26) — hypothesis INVERTED
+
+Hypothesis under test: MTP chunked-verify (width 4) bundles KV reads and
+may favor fp16 (bandwidth-bound) independent of acceptance.
+
+CODE-LEVEL (before measuring): suffix_step metal_engine.cpp:3139 — with
+match < min_match, live=0, NO batched verify dispatches at all; the round
+falls back to serial step(). "Independent of acceptance" is structurally
+false: bundling exists only in burst rounds (match>=min_match).
+Cheap check (7168, forced always-fallback via min-match 999, verified
+burst=0/fb=756): MTP-on costs -0.7..-0.8% tg vs greedy in BOTH KV
+modes. Production default is already MTP-off (metal_cli mtp_width=0).
+
+2x2 GRID (Q27_METAL_ATT=w4 everywhere = attention tile rows, distinct
+from MTP draft width w4/mm12; corpus = 4 real-workload corpora x5 to
+reach 97K tokens, seq 65400, gen 32; step2/*.jsonl):
+  @64K:  t3 off 6.94 | t3 on 5.84 (-15.8%)   f16 off 6.61 | f16 on 5.52 (-16.5%)
+  @7168: t3 off 13.53 | t3 on 12.45 (-8.0%)  f16 off 13.35 | f16 on 13.07 (-2.1%)
+Burst stats @64K: burst=5 acc=15 fb=11 — ~4 tokens committed per
+16-lane burst round; wasted lanes each read the FULL 64K KV.
+
+FINDING: the bundling effect does not rescue fp16; MTP-on LOSES at long
+context in both KV modes, and the penalty SCALES WITH ATTENTION SHARE:
+2048 (Phase 2A, attn ~10% of step): +-1% | 7168 (attn ~30-40%):
+-2..-8% | 64K (attn ~66%): -16%. Wasted-lane cost ~ lanes x KV-depth:
+long context AMPLIFIES speculation waste. Off-side numbers corroborated
+by independent prior runs (t3 greedy 6.90/6.89, f16 w4 6.59).
+Practical: MTP-off default is not just harmless but strongly correct at
+long context. Knowledge-grade per agreement: no config change (already off).
+Caveats: rep2 skipped (chain script omitted rep from filenames — skip
+logic saw rep1 files); effect is 6x noise band and consistent across
+both KV modes, so single-rep on-side accepted. Corpus x5 repetition
+inflates acceptance vs real workloads — with REAL acceptance (~0) the
+result is strictly worse for MTP-on (all-fallback = -0.8%, no upside).
+
 ## #3 fp16 w4 port (branch m1max/f16-w4, 2026-09-26) — EXPLORATORY, default unchanged
 
 Purpose: make "turbo3 wins" a TESTED conclusion, not an untested one.
