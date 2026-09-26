@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
                 for (size_t pi = 0; pi < psos.size(); pi++) {
                     auto pso = psos[pi];
                     NSString* n = [NSString stringWithUTF8String:pnames[pi].c_str()];
-                    BOOL gqa_arm = [n hasPrefix:@"q27_attention_turbo3_gqa"] || [n hasPrefix:@"attn_"];
+                    BOOL gqa_arm = [n hasPrefix:@"q27_attention_turbo3_gqa"] || [n hasPrefix:@"attn_"] || [n hasPrefix:@"q27_attention_f16_gqa"];  // #3: f16_gqa was stuck at block=1024 (16 threadgroups @2048 = starved); sweep it fairly
                     BOOL plain = [n isEqualToString:@"q27_attention_turbo3"] || [n isEqualToString:@"q27_attention_f16"];
                     BOOL merge = [n isEqualToString:@"q27_attention_gqa_merge"];
                     if (merge) continue;                     // timed with parent
