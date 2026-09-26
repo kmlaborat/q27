@@ -11,6 +11,62 @@ harness → kernel work). Model under test: Qwen3.6-27B-MTP **q4s** tier
 (`models/qwen36-27b-mtp-q4s.q27`, md5 `7e5454e0c0ded717136ad3e42634ba25`, 15.46 GB,
 tokenizer `models/qwen36-27b-mtp.tok` md5 `bb95b3ca7647ce1cc061c141789e7102`).
 
+## FINAL STATE (2026-09-26) — campaign closed, everything merged to master
+
+This section is the single restart point. The sections below are in mixed
+append order (newest-first at the top, chronological below); where anything
+here disagrees with the Day-1 TL;DR further down, this section wins.
+
+### Shipped performance (this M1 Max, q4s, all gates passed)
+
+| Area | Change | Measured effect |
+|---|---|---|
+| Decode GEMV | `q27_matvec_q4_quantized_h` (f16 magic-number dot) | tg +26%, bit-identical |
+| Prefill GEMM | `mm_h` promoted to default for Q4 prefill | pp +47% |
+| Decode attention | `q27_attention_turbo3_gqa_w2` → `..._w4` (4-row tiles) | +28% then +15.8% @64K (+49% cumulative vs row-route); +10% / +4.8% @7168 |
+| Serving config | `--kv turbo3` + w4 attention | NIAHF@64K 9/9 == fp16; golden digest-identical; 4x smaller KV |
+
+Production-path cumulative: 64K decode 4.64 → 6.90 t/s (+49%), 7168
+11.64 → 13.45 t/s (+15.5%), short-context pp +47%. Whole-campaign engine
+diff: +462 insertions across 4 files (`da4c557^..HEAD`, 32 commits); the
+remaining ~6.7K lines are bench harness, probes, and records.
+
+### Rollback ladder (env-only, no rebuild)
+
+- `Q27_METAL_ATT=row` — pre-w2 row-route attention
+- `Q27_METAL_ATT=w2` — intermediate fallback between row and w4
+- `Q27_METAL_GEMM_HALF_Q4=0` — pre-`mm_h` prefill GEMM
+- `--kv fp16` — reference KV path (fp16 w4 available via `Q27_METAL_ATT=w4`, opt-in)
+
+### Proven do-not-touch settings (measured on this machine)
+
+- **MTP ON at long context: −16% tg @64K** (both KV modes; penalty scales
+  with attention share: ±1% @2048 → −2..−8% @7168 → −16% @64K; wasted
+  lanes each read the full KV). `mtp_width=0` default is strongly correct.
+- **turbo3 50B→64B KV padding: no effect** (+1.3% stream time for +28%
+  bytes). Alignment was never the problem.
+- **fp16 as serving default: loses** — turbo3 wins +0.7% @7168 / +4.7%
+  @64K with 4x KV savings. Now a tested conclusion, not an assumption.
+
+### Remaining walls (rewrite-class; separate projects, boundary agreed)
+
+- Prefill FFN: dequant-ALU-bound (~18x off the weight-stream roof;
+  chunk-size widening cannot help — dequant work is fixed per weight byte).
+- Prefill attention: row-serial SIMT structure (Flash-style rewrite class).
+- GDN: sequential recurrence (the 448-occupancy lineage).
+- No single-day lever remains anywhere in pp or tg per the #4 inventory.
+
+### Structural guards added (same-class-hole prevention)
+
+- Makefile targets for every campaign harness tool with the full engine
+  source set as prerequisites — the stale-binary trap (bitten twice) is
+  now structurally impossible.
+- Chain scripts require the rep number in both jsonl and log filenames —
+  the silent-skip hole (same class) is closed.
+
+---
+
+
 ## #4 pp stage-share inventory (branch m1max/d3-ppshare, 2026-09-26) — NO cheap win remains
 
 New diagnostic: MetalEngine::pp_profile_chunk (env-free, diagnostic-only,
@@ -158,7 +214,7 @@ closed or parked with attribution. Verification holes closed en route:
 golden never exercised turbo3 (Q27_GOLDEN_TURBO3), GPU-concurrency
 contamination (serial-only rule), ingest_prompt reset_first trap.
 
-## TL;DR — where things stand
+## Day-1 TL;DR (2026-09-23 — HISTORICAL, superseded by FINAL STATE above; kept as the DeltaNet-448 origin record)
 
 1. **DeltaNet occupancy bug: FIXED and verified.** The 512-thread gate in
    `metal_backend.mm` killed all generation on Apple7 GPUs (measured occupancy
@@ -185,10 +241,14 @@ contamination (serial-only rule), ingest_prompt reset_first trap.
 ```bash
 cd /Users/user/projects/q27
 make build/q27-metal build/q27-metal-server build/test-metal-ops build/test-metal-backend
-c++ -O2 -std=c++17 -Wall -Wextra -Werror -fobjc-arc -pthread -I src/metal \
-  tools/bench_metal.cpp src/metal/metal_engine.cpp src/metal/metal_backend.mm \
-  src/loader.cpp src/tokenizer.cpp -framework Foundation -framework Metal -o build/bench_metal
-# same one-liner builds tools/golden_metal.cpp -> build/golden_metal
+# Campaign harness tools — the Makefile targets are the ONLY sanctioned build
+# path for these. Each target lists the full engine source set (incl.
+# q27_kernels.metal) as prerequisites, so a stale binary can never "verify"
+# a change it does not contain. This guard exists because the ad-hoc one-liner
+# builds below (the original Day-1 workflow) bit the stale-binary trap twice.
+make build/bench_metal build/golden_metal build/pp_share \
+     build/attn_roof build/pf_roof build/pf_attn_roof \
+     build/niahf_probe build/prefix_probe build/kv_footprint
 ```
 
 Key engine env vars: `Q27_METAL_DIAG=1` (pipeline occupancy log),
@@ -197,7 +257,7 @@ Instruments' Metal System Trace works but its Shader Timeline is off by default
 and per-kernel breakdown was not obtained), `Q27_METAL_GQA_THRESHOLD`,
 `Q27_METAL_GQA_BLOCK`.
 
-## Code changes made (uncommitted, `git diff` = 182 insertions)
+## Day-1 code changes (HISTORICAL — committed in `c12bfc6`; the final campaign engine diff is +462 lines / 4 files, see FINAL STATE)
 
 ### `src/metal/q27_kernels.metal`
 - Added `q27_delta_step256` and `q27_delta_chunk256`: two physical tiles loop
@@ -810,4 +870,31 @@ src/metal/
   q27_kernels.metal              q27_delta_step256, q27_delta_chunk256
   powermetrics_log.txt           (user-collected, 46K samples)
 models/                          q4s weights + tokenizer (downloaded, checksummed)
+```
+
+### File map additions (Phases 2B–D, final)
+
+```
+bench/m1max/
+  UPSTREAM_DRAFT.md              upstream sharing draft (6 sections, not filed)
+  roofline_m1.jsonl / attn_roof_*.jsonl / attn_t3_w2row.jsonl
+  f16_w4_roof2.jsonl             fair f16 attention sweep (supersedes roof.jsonl:
+                                 f16_gqa was block-starved in the first sweep)
+  f16_ab_{7168,64k}_{row,w4}.jsonl   fp16 w4 engine A/B
+  d_step0_rss.jsonl / d_step1a_*.log  footprint + prefix-resume probes
+  d_step1b_*.jsonl               w2row engine A/B (64K + short-regress)
+  d_niahf.jsonl                  NIAHF@64K turbo3-vs-fp16 (9/9 identical)
+  d2_align_probe.jsonl           50B-vs-64B stride probe (dead end)
+  d2_w4row.jsonl / d2_w4_64k_r{1,2}.jsonl   w4 kernel + engine A/B
+  step2/                         MTP x KV 2x2 grid + cheap fallback check
+  step2_corpus64k.txt            97K-token corpus (4 real corpora x5; repetition
+                                 inflates acceptance — see Step 2 caveats)
+  phase2a/                       speculation sweep corpora + results
+tools/
+  attn_roof.mm / bench_attn.metal        decode attention roof + arms
+  pf_roof.mm / bench_pf.metal          prefill GEMM roof + attribution arms
+  pf_attn_roof.mm / bench_pf_attn_arms.txt  prefill attention roof
+  pp_share.cpp                   pp stage-share inventory (uses engine's
+                                 pp_profile_chunk; commit-overhead subtracted)
+  niahf_probe.cpp / prefix_probe.cpp / kv_footprint.cpp   Phase D probes
 ```

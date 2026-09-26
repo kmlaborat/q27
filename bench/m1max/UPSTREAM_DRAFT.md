@@ -8,7 +8,7 @@ hardware before quoting.
 
 Suggested venue: one umbrella discussion ("M-series generational assumptions
 in Metal tuning constants") with the items below as sections, rather than
-five separate issues.
+six separate issues.
 
 ---
 
@@ -72,12 +72,51 @@ note in the repo so future tuning starts from real-text corpora.
 
 ---
 
+## 6. Long-context re-evaluation: attention tile-row wins, and speculation waste
+   scales with KV depth
+
+Two findings from pushing this machine to 64K context that revise earlier
+short-context reads:
+
+a) **Decode attention tile rows.** The 2-row/tile variant measured −33%
+kernel time but +0.3% tg at 2048 — dismissed as shadowed. At 64K, where
+attention is ~66% of the decode step, the same technique (extended to
+4-row tiles) measured +28% then +15.8% tg on top (cumulative +49% vs the
+row route), golden digest-identical. Lesson for the repo: a kernel win that
+looks "shadowed" at short context can be the dominant win at long context —
+re-measure attention changes at the depth where attention share dominates,
+not at the depth that's convenient to run.
+
+b) **Speculation waste amplifies with context.** With forced-fallback
+(acceptance≈0) MTP costs −0.8% tg (drafter overhead). With burst rounds
+firing at moderate acceptance, MTP-on costs −16% tg at 64K in both fp16
+and turbo3 KV paths, and the penalty tracks attention share (±1% @2048 →
+−2..−8% @7168 → −16% @64K): every wasted lane re-reads the full KV.
+Combined with section 5 (acceptance is corpus-bound), the practical rule
+for long-context agents is that speculative decode defaults-off is not
+merely safe but strongly correct on real workloads.
+
+c) **fp16-vs-quantized attention head-to-head at w4.** After porting the
+4-row tiling to the fp16 KV path (−47% kernel vs fp16 row-route), fp16
+nearly closes the gap to turbo3 (+0.7% @7168 / +4.7% @64K remaining for
+turbo3) because w4 removes the dequant latency that dominated and fp16
+then runs near its bandwidth roof. The quantization bandwidth advantage is
+largely cancelled once streaming is no longer the bottleneck; turbo3's
+remaining case is the 4x KV memory saving, not speed.
+
+---
+
 ### Reproduction pointers (all in-tree)
 
 - decode A/B: `tools/bench_metal.cpp` arms; `tools/grid_m1.sh`
 - prefill gate/rollback + margins: `tools/golden_metal.cpp`,
   `bench/m1max/golden_m1_h4_margins_*.jsonl`
-- attention roofline probes: `tools/attn_roof.mm`
+- attention roofline probes: `tools/attn_roof.mm` (tile-row arms:
+  `attn_w2row`, `attn_f16_w4row`, `attn_t3_w4row`, stride probes
+  `attn_t3_stream50/64`)
 - prefill GEMM waterfall + attribution arms: `tools/pf_roof.mm`,
   `tools/bench_pf.metal` (bit-identity harness included)
 - speculation corpus harness: `bench/m1max/phase2a/`
+- long-context 2x2 (MTP x KV) + forced-fallback check: `bench/m1max/step2/`
+- pp stage attribution: engine `pp_profile_chunk` + `tools/pp_share.cpp`
+- long-context quality gate: `tools/niahf_probe.cpp` (`d_niahf.jsonl`)
