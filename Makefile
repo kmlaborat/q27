@@ -513,3 +513,43 @@ endif
 
 build/dflash2_smoke: tools/dflash2_smoke.cu src/dflash2.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp | build
 	$(NVCC) $(NVCCFLAGS) tools/dflash2_smoke.cu src/dflash2.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp -o $@
+
+# --- m1max campaign harness tools -------------------------------------------------
+# STRUCTURAL GUARD: these tools were historically built with ad-hoc one-liners,
+# and the stale-binary trap bit twice (old binary matching "verified" a change it
+# did not contain). Build them ONLY through make so staleness is impossible:
+# every target lists the full engine source set as prerequisites.
+CAMPAIGN_SRC := src/metal/metal_engine.cpp src/metal/metal_engine.h \
+  src/metal/metal_backend.mm src/metal/metal_backend.h src/metal/q27_kernels.metal \
+  src/loader.cpp src/loader.h src/tokenizer.cpp src/tokenizer.h src/backend.h
+
+build/bench_metal: tools/bench_metal.cpp $(CAMPAIGN_SRC) | build
+	$(CXX) $(METALFLAGS) -I src tools/bench_metal.cpp src/metal/metal_engine.cpp \
+	  src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp $(METALLIBS) -o $@
+
+build/golden_metal: tools/golden_metal.cpp $(CAMPAIGN_SRC) | build
+	$(CXX) $(METALFLAGS) -I src tools/golden_metal.cpp src/metal/metal_engine.cpp \
+	  src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp $(METALLIBS) -o $@
+
+build/niahf_probe: tools/niahf_probe.cpp $(CAMPAIGN_SRC) | build
+	$(CXX) $(METALFLAGS) -I src tools/niahf_probe.cpp src/metal/metal_engine.cpp \
+	  src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp $(METALLIBS) -o $@
+
+build/prefix_probe: tools/prefix_probe.cpp $(CAMPAIGN_SRC) | build
+	$(CXX) $(METALFLAGS) -I src tools/prefix_probe.cpp src/metal/metal_engine.cpp \
+	  src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp $(METALLIBS) -o $@
+
+build/kv_footprint: tools/kv_footprint.cpp $(CAMPAIGN_SRC) | build
+	$(CXX) $(METALFLAGS) -I src tools/kv_footprint.cpp src/metal/metal_engine.cpp \
+	  src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp $(METALLIBS) -o $@
+
+# Roofline drivers compile the Metal sources at runtime; list them as deps so a
+# kernel edit invalidates the harness binary too.
+build/attn_roof: tools/attn_roof.mm src/metal/q27_kernels.metal tools/bench_attn.metal | build
+	$(CXX) -O2 -std=c++17 -fobjc-arc -o $@ tools/attn_roof.mm $(METALLIBS)
+
+build/pf_attn_roof: tools/pf_attn_roof.mm src/metal/q27_kernels.metal tools/bench_pf_attn_arms.txt | build
+	$(CXX) -O2 -std=c++17 -fobjc-arc -o $@ tools/pf_attn_roof.mm $(METALLIBS)
+
+build/pf_roof: tools/pf_roof.mm src/metal/q27_kernels.metal tools/bench_pf.metal | build
+	$(CXX) -O2 -std=c++17 -fobjc-arc -o $@ tools/pf_roof.mm $(METALLIBS)
