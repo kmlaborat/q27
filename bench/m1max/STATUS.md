@@ -39,9 +39,17 @@ context in both KV modes, and the penalty SCALES WITH ATTENTION SHARE:
 long context AMPLIFIES speculation waste. Off-side numbers corroborated
 by independent prior runs (t3 greedy 6.90/6.89, f16 w4 6.59).
 Practical: MTP-off default is not just harmless but strongly correct at
-long context. Knowledge-grade per agreement: no config change (already off).
+long context. WARNING for future enablers: turning MTP ON at long context
+costs -16% tg immediately (@64K, both KV modes, measured). The rule to
+remember: wasted-lane cost ~ lanes x KV-depth, i.e. it scales with
+attention share — "speculation is basically faster" is FALSE on this
+machine at long context with realistic acceptance. Do not enable MTP
+based on general-purpose priors; this number is the specific counter-
+evidence. (mtp_width=0 default stands.) Knowledge-grade per agreement: no config change (already off).
 Caveats: rep2 skipped (chain script omitted rep from filenames — skip
-logic saw rep1 files); effect is 6x noise band and consistent across
+logic saw rep1 files; FIXED structurally in step2_chain.sh: rep number now
+mandatory in both jsonl and log filenames, same class of hole as the
+stale-binary trap); effect is 6x noise band and consistent across
 both KV modes, so single-rep on-side accepted. Corpus x5 repetition
 inflates acceptance vs real workloads — with REAL acceptance (~0) the
 result is strictly worse for MTP-on (all-fallback = -0.8%, no upside).
