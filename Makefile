@@ -553,3 +553,7 @@ build/pf_attn_roof: tools/pf_attn_roof.mm src/metal/q27_kernels.metal tools/benc
 
 build/pf_roof: tools/pf_roof.mm src/metal/q27_kernels.metal tools/bench_pf.metal | build
 	$(CXX) -O2 -std=c++17 -fobjc-arc -o $@ tools/pf_roof.mm $(METALLIBS)
+
+build/pp_share: tools/pp_share.cpp $(CAMPAIGN_SRC) | build
+	$(CXX) $(METALFLAGS) -I src tools/pp_share.cpp src/metal/metal_engine.cpp \
+	  src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp $(METALLIBS) -o $@

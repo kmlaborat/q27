@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <chrono>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1813,6 +1814,49 @@ void MetalEngine::chunk_forward(const uint32_t* tokens, uint32_t count, bool ver
         ffn_chunk(layer, count);
         backend_.add_inplace(*ch_, *cy_, count * N_EMBD);
     }
+}
+
+MetalEngine::PPStageMs MetalEngine::pp_profile_chunk(const uint32_t* tokens,
+                                                     uint32_t count) {
+    using clock = std::chrono::steady_clock;
+    auto ms_since = [](clock::time_point start) {
+        return std::chrono::duration<double, std::milli>(clock::now() - start).count();
+    };
+    PPStageMs r;
+    if (!ch_ || count < 2 || count > PREFILL_CHUNK_MAX)
+        throw std::runtime_error("q27 Metal: pp_profile_chunk invalid args");
+    // Empty commit baseline: begin+end with no dispatch. Subtracted from
+    // every stage so the numbers are GPU work, not commit latency.
+    { CommandBatch b(backend_); b.finish(); r.empty_commit = ms_since(clock::now()); }
+    auto timed = [&](double& acc, const std::function<void()>& work) {
+        CommandBatch b(backend_);
+        auto t0 = clock::now();
+        work();
+        b.finish();
+        acc += ms_since(t0) - r.empty_commit;
+    };
+    timed(r.emb, [&] {
+        backend_.embedding_q8_rows(weight("token_embd.weight"), tokens, count, *ch_);
+    });
+    BackendQuantized x5 = quantized_view(cq5120_, count * N_EMBD);
+    for (uint32_t layer = 0; layer < N_LAYER; layer++) {
+        timed(r.norm1, [&] {
+            backend_.rmsnorm_rows_quantized(*ch_, layer_weight(layer, "attn_norm.weight"),
+                                            *cx1_, N_EMBD, count, EPS, x5);
+        });
+        if (attention_layer(layer))
+            timed(r.attn, [&] { attention_chunk(layer, count); });
+        else
+            timed(r.gdn, [&] { gdn_chunk(layer, count, false); });
+        timed(r.add1, [&] { backend_.add_inplace(*ch_, *cy_, count * N_EMBD); });
+        timed(r.norm2, [&] {
+            backend_.rmsnorm_rows_quantized(*ch_, layer_weight(layer, "post_attention_norm.weight"),
+                                            *cx1_, N_EMBD, count, EPS, x5);
+        });
+        timed(r.ffn, [&] { ffn_chunk(layer, count); });
+        timed(r.add2, [&] { backend_.add_inplace(*ch_, *cy_, count * N_EMBD); });
+    }
+    return r;
 }
 
 // Commits GDN state (recurrent + convolution ring) for the first `count`

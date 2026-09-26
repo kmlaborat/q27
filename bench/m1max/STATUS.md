@@ -11,6 +11,35 @@ harness → kernel work). Model under test: Qwen3.6-27B-MTP **q4s** tier
 (`models/qwen36-27b-mtp-q4s.q27`, md5 `7e5454e0c0ded717136ad3e42634ba25`, 15.46 GB,
 tokenizer `models/qwen36-27b-mtp.tok` md5 `bb95b3ca7647ce1cc061c141789e7102`).
 
+## #4 pp stage-share inventory (branch m1max/d3-ppshare, 2026-09-26) — NO cheap win remains
+
+New diagnostic: MetalEngine::pp_profile_chunk (env-free, diagnostic-only,
+does not advance position_) mirrors chunk_forward with a per-stage commit;
+empty-commit overhead measured and subtracted. Tool: tools/pp_share.cpp
+(Makefile target). Profiled turbo3+fp16 @ ctx8192, positions
+0/3584/7104, reps 3, chunk=96.
+
+SHARES at 7168 (extrapolated; turbo3; ms/token):
+  FFN   9.67  ~43%   <- the next share leader
+  attn   7.3  ~33%   (grows 1.3 -> 13.7 ms/tok from pos 0 -> 7104)
+  GDN   3.93  ~18%   (position-independent, 48 layers)
+  norm+add 1.1 ~5%
+  emb   ~0
+Profiler sanity: EXTRAP 44.6 t/s vs measured pp 48.3 (8% commit-overhead
+inflation; shares trustworthy, absolutes slightly high). fp16 same fixed
+side (ffn 9.63, gdn 3.91), attn slightly higher (15.1 vs 13.7 @7104).
+
+WHY NO CHEAP WIN: FFN at 9.67 ms/tok vs weight-stream roof ~0.52 ms/tok
+(FFN ~10GB q4 / 96 tok/chunk / 200GB/s) = ~18x off roof => dequant-ALU
+-bound (~43G dequant-ops/s implied), NOT bandwidth. Consequence: raising
+PREFILL_CHUNK_MAX does NOT help (dequant work is fixed per weight byte,
+independent of M). FFN further = dequant-rewrite class (the parked
+smem-free redesign). attn = the row-serial SIMT wall (closed, rewrite).
+GDN = sequential recurrence per the 448-occupancy lineage. All three
+leaders are already-classified rewrite-grade walls; norm/add/emb have
+nothing. INVENTORY CLOSED: pp short-distance has no harvestable
+single-day lever.
+
 ## Phase D Step 2: MTP x KV 2x2 @64K (2026-09-26) — hypothesis INVERTED
 
 Hypothesis under test: MTP chunked-verify (width 4) bundles KV reads and

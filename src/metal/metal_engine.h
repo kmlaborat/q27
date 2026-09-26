@@ -227,6 +227,18 @@ class MetalEngine {
     // the pending token, exactly like prefill()'s serial tail.
     void prefill_chunk(const uint32_t* tokens, uint32_t count);
     static constexpr uint32_t prefill_chunk_max() { return PREFILL_CHUNK_MAX; }
+
+    // m1max #4 diagnostic: per-stage GPU wall time for one prefill chunk.
+    // Mirrors chunk_forward exactly but commits per stage so each category
+    // (embedding / norm / attn / gdn / ffn / residual-add) is isolated on
+    // the GPU timeline. Empty-commit overhead is measured per call and
+    // subtracted from every stage. Diagnostic only: does not advance
+    // position_, does not alter production paths.
+    struct PPStageMs {
+        double emb = 0, norm1 = 0, attn = 0, gdn = 0, add1 = 0,
+               norm2 = 0, ffn = 0, add2 = 0, empty_commit = 0;
+    };
+    PPStageMs pp_profile_chunk(const uint32_t* tokens, uint32_t count);
     // One MTP draft/verify/commit round (one scheduling quantum). Appends
     // the committed tokens (always starting with `pending`) to `committed`;
     // the caller emits them and stops at `eos` itself — tokens after an EOS
